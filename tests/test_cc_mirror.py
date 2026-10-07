@@ -104,6 +104,8 @@ def make_store(m, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "STATE", str(tmp_path / "state.json"))
     monkeypatch.setattr(m, "LOCKFILE", str(tmp_path / "lock"))
     monkeypatch.setattr(m, "CONFIG", str(tmp_path / "no-config.json"))
+    monkeypatch.setattr(m, "CLAUDE_DIR", str(tmp_path / "no-claude"))
+    monkeypatch.setattr(m, "LS_DIR", str(tmp_path / "no-claude" / "ls"))
     return base, proj
 
 
@@ -180,3 +182,153 @@ def test_archive_flip_propagates(m, tmp_path, monkeypatch):
     run_main(m, monkeypatch)
     copy = json.loads((base / "acctB" / "orgB" / "local_s1.json").read_text())
     assert copy["isArchived"] is True
+
+
+def set_flag(fp, key, value):
+    d = json.loads(fp.read_text())
+    d[key] = value
+    fp.write_text(json.dumps(d))
+
+
+def test_pin_and_unpin_propagate(m, tmp_path, monkeypatch):
+    base, proj = make_store(m, tmp_path, monkeypatch)
+    (proj / "cli-1.jsonl").write_text('{"type":"custom-title","customTitle":"T"}\n')
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T")
+    b = write_entry(base, "acctB", "orgB", "s1", "cli-1", "T")
+    run_main(m, monkeypatch)
+
+    set_flag(b, "isStarred", True)
+    run_main(m, monkeypatch)
+    assert json.loads(a.read_text())["isStarred"] is True
+
+    set_flag(a, "isStarred", False)
+    run_main(m, monkeypatch)
+    assert json.loads(b.read_text())["isStarred"] is False
+
+
+def test_pin_bootstrap_starred_anywhere_wins(m, tmp_path, monkeypatch):
+    base, proj = make_store(m, tmp_path, monkeypatch)
+    (proj / "cli-1.jsonl").write_text('{"type":"custom-title","customTitle":"T"}\n')
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T")
+    b = write_entry(base, "acctB", "orgB", "s1", "cli-1", "T")
+    set_flag(a, "isStarred", True)
+    (tmp_path / "state.json").write_text(json.dumps({"cli-1": {"isArchived": False, "title": "T"}}))
+
+    run_main(m, monkeypatch)
+    assert json.loads(b.read_text())["isStarred"] is True
+    assert json.loads(a.read_text())["isArchived"] is False
+
+
+def test_progress_follows_most_recent_copy_and_account_fields_stay(m, tmp_path, monkeypatch):
+    base, proj = make_store(m, tmp_path, monkeypatch)
+    (proj / "cli-1.jsonl").write_text('{"type":"custom-title","customTitle":"T"}\n')
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T", activity=100)
+    b = write_entry(base, "acctB", "orgB", "s1", "cli-1", "T", activity=200)
+    set_flag(a, "remoteMcpServersConfig", ["A"])
+    set_flag(a, "chromeTabGroupId", 1)
+    set_flag(a, "lastFocusedAt", 5)
+    set_flag(b, "completedTurns", 9)
+    set_flag(b, "postTurnSummary", {"status": "done"})
+    set_flag(b, "remoteMcpServersConfig", ["B"])
+
+    run_main(m, monkeypatch)
+    da = json.loads(a.read_text())
+    assert da["lastActivityAt"] == 200
+    assert da["completedTurns"] == 9
+    assert da["postTurnSummary"] == {"status": "done"}
+    assert da["remoteMcpServersConfig"] == ["A"]
+    assert da["chromeTabGroupId"] == 1
+    assert da["lastFocusedAt"] == 5
+
+
+def test_setting_change_propagates_against_base(m, tmp_path, monkeypatch):
+    base, proj = make_store(m, tmp_path, monkeypatch)
+    (proj / "cli-1.jsonl").write_text('{"type":"custom-title","customTitle":"T"}\n')
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T", activity=100)
+    b = write_entry(base, "acctB", "orgB", "s1", "cli-1", "T", activity=200)
+    set_flag(a, "model", "opus")
+    set_flag(b, "model", "opus")
+    run_main(m, monkeypatch)
+
+    set_flag(a, "model", "sonnet")
+    run_main(m, monkeypatch)
+    assert json.loads(b.read_text())["model"] == "sonnet"
+
+
+def test_quiet_summary_keeps_swivel_format(m, tmp_path, monkeypatch, capsys):
+    base, proj = make_store(m, tmp_path, monkeypatch)
+    (proj / "cli-1.jsonl").write_text('{"type":"custom-title","customTitle":"T"}\n')
+    write_entry(base, "acctA", "orgA", "s1", "cli-1", "T", activity=100)
+    b = write_entry(base, "acctB", "orgB", "s1", "cli-1", "T", activity=200)
+    set_flag(b, "completedTurns", 3)
+    run_main(m, monkeypatch)
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("cc-mirror-sessions: added 0,")
+    assert line.endswith("state-synced 1, pin-list 0")
+
+
+def make_claude_dir(tmp_path, acct, starred, order=None, running=False):
+    cdir = tmp_path / "claude"
+    ldir = cdir / "Local Storage" / "leveldb"
+    ldir.mkdir(parents=True)
+    (ldir / "LOCK").write_text("")
+    (cdir / "config.json").write_text(json.dumps({"lastKnownAccountUuid": acct}))
+    prefs = {"other": {"keep": "me"}, "starred-local-code-sessions": starred}
+    if order is not None:
+        prefs["dframe-local-slice"] = {"pinnedOrder": order, "x": 1}
+    cfg = {"deploymentMode": "1p", "preferences": {"menuBarEnabled": False, "epitaxyPrefs": prefs}}
+    (cdir / "claude_desktop_config.json").write_text(json.dumps(cfg, indent=2))
+    return cdir
+
+
+def prefs_of(cdir):
+    return json.loads((cdir / "claude_desktop_config.json").read_text())["preferences"]
+
+
+def test_pin_list_follows_index(m, tmp_path, monkeypatch):
+    base, _ = make_store(m, tmp_path, monkeypatch)
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T")
+    write_entry(base, "acctA", "orgA", "s2", "cli-2", "T")
+    set_flag(a, "isStarred", True)
+    cdir = make_claude_dir(tmp_path, "acctA", ["local_s2", "local_gone"],
+                           order=["code:local_s2", "cowork:x"])
+    folders = m.discover_folders([])
+
+    assert m.sync_starred_list(folders, True, claude_dir=str(cdir)) == 1
+    assert prefs_of(cdir)["epitaxyPrefs"]["starred-local-code-sessions"] == ["local_s2", "local_gone"]
+
+    assert m.sync_starred_list(folders, False, claude_dir=str(cdir)) == 1
+    p = prefs_of(cdir)
+    assert p["epitaxyPrefs"]["starred-local-code-sessions"] == ["local_gone", "local_s1"]
+    assert p["epitaxyPrefs"]["dframe-local-slice"] == {
+        "pinnedOrder": ["code:local_s2", "cowork:x", "code:local_gone", "code:local_s1"], "x": 1}
+    assert p["epitaxyPrefs"]["other"] == {"keep": "me"}
+    assert p["menuBarEnabled"] is False
+    assert m.sync_starred_list(folders, False, claude_dir=str(cdir)) == 0
+
+
+def test_pin_list_skips_when_claude_running(m, tmp_path, monkeypatch):
+    import subprocess
+    base, _ = make_store(m, tmp_path, monkeypatch)
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T")
+    set_flag(a, "isStarred", True)
+    cdir = make_claude_dir(tmp_path, "acctA", [])
+    lock = cdir / "Local Storage" / "leveldb" / "LOCK"
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import fcntl,os,sys,time;fd=os.open(sys.argv[1],os.O_RDWR);"
+                               "fcntl.lockf(fd,fcntl.LOCK_EX);print('x',flush=True);time.sleep(30)",
+                               str(lock)], stdout=subprocess.PIPE)
+    try:
+        holder.stdout.readline()
+        assert m.sync_starred_list(m.discover_folders([]), False, claude_dir=str(cdir)) == 0
+        assert prefs_of(cdir)["epitaxyPrefs"]["starred-local-code-sessions"] == []
+    finally:
+        holder.kill()
+
+
+def test_pin_list_leaves_other_account_alone(m, tmp_path, monkeypatch):
+    base, _ = make_store(m, tmp_path, monkeypatch)
+    a = write_entry(base, "acctA", "orgA", "s1", "cli-1", "T")
+    set_flag(a, "isStarred", True)
+    cdir = make_claude_dir(tmp_path, "acctB", [])
+    assert m.sync_starred_list(m.discover_folders([]), False, claude_dir=str(cdir)) == 0

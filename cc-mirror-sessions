@@ -64,12 +64,13 @@ Usage:
     cc-mirror-sessions --dead-home <orgUuid>   # account to keep dead sessions in
     cc-mirror-sessions --no-restore            # skip reviving from the transcript archive
     cc-mirror-sessions --archive <glob>        # override transcript-archive location
-    cc-mirror-sessions --no-flag-sync          # skip isArchived/title propagation
+    cc-mirror-sessions --no-flag-sync          # skip isArchived/isStarred/title propagation
 """
 
 import argparse
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -90,6 +91,12 @@ STATE = os.path.join(HOME, ".claude", "cc-mirror-state.json")
 #     "archive":   "<recursive glob of raw-transcript backups; ~ is expanded>",
 #     "exclude":   ["<uuid>", ...] }
 CONFIG = os.path.join(HOME, ".claude", "cc-mirror.json")
+PROGRESS_KEYS = ("lastActivityAt", "completedTurns", "latestUserFrameAt", "lastAssistantUuid",
+                 "postTurnSummary", "postTurnSummaryFor", "titleTurn", "previousTitles",
+                 "writtenBranches", "publishedArtifacts")
+SETTING_KEYS = ("model", "effort", "permissionMode", "chromePermissionMode", "sessionSettings",
+                "classifierSummaryEnabled", "alwaysAllowedReasons", "sessionPermissionUpdates",
+                "resolvedBackgroundTaskSuggestions")
 
 
 def load_config(path=None):
@@ -186,6 +193,10 @@ def transcript_title(path, window=262144):
     return None
 
 
+def value_hash(v):
+    return hashlib.sha1(json.dumps(v, sort_keys=True).encode()).hexdigest()[:12]
+
+
 def load(fp):
     try:
         with open(fp) as f:
@@ -259,6 +270,93 @@ def restore_dead(folder_files, stems, pattern, dry_run):
     return revived
 
 
+CLAUDE_DIR = os.path.join(HOME, "Library", "Application Support", "Claude")
+LS_DIR = os.path.join(CLAUDE_DIR, "Local Storage", "leveldb")
+STARRED_PREF = "starred-local-code-sessions"
+
+
+def claude_running(ldir=None):
+    lock_path = os.path.join(ldir or LS_DIR, "LOCK")
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def sync_starred_list(folders, dry_run, claude_dir=None, ldir=None):
+    """Make the live account's pin list in claude_desktop_config.json
+    (preferences.epitaxyPrefs) match isStarred in its index files. The app
+    seeds its sidebar pins from that list at launch. Returns 1 when the list
+    changed, 0 when it already matched, Claude is running, or the file is
+    missing or unexpected."""
+    cdir = claude_dir or CLAUDE_DIR
+    if claude_running(ldir or os.path.join(cdir, "Local Storage", "leveldb")):
+        return 0
+    try:
+        with open(os.path.join(cdir, "config.json")) as f:
+            acct = json.load(f).get("lastKnownAccountUuid") or ""
+    except Exception:
+        return 0
+    starred, present, activity = set(), set(), {}
+    for a, _, path in folders:
+        if a != acct:
+            continue
+        for fp in glob.glob(os.path.join(path, "local_*.json")):
+            name = os.path.basename(fp)[:-5]
+            d = load(fp)
+            present.add(name)
+            activity[name] = max(activity.get(name, 0), d.get("lastActivityAt") or 0)
+            if d.get("isStarred"):
+                starred.add(name)
+    if not present:
+        return 0
+    cfg_path = os.path.join(cdir, "claude_desktop_config.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            raw = f.read()
+        cfg = json.loads(raw)
+        prefs = cfg["preferences"]["epitaxyPrefs"]
+        current = prefs.get(STARRED_PREF, [])
+        if not isinstance(current, list):
+            return 0
+    except Exception:
+        return 0
+    keep = [x for x in current if x in starred or x not in present]
+    wanted = keep + sorted(starred - set(keep), key=lambda n: -activity.get(n, 0))
+    order = None
+    slice_ = prefs.get("dframe-local-slice")
+    if isinstance(slice_, dict) and isinstance(slice_.get("pinnedOrder"), list):
+        cur_order = slice_["pinnedOrder"]
+        order = cur_order + ["code:" + n for n in wanted if "code:" + n not in cur_order]
+        if order == cur_order:
+            order = None
+    if wanted == current and order is None:
+        return 0
+    if not dry_run:
+        prefs[STARRED_PREF] = wanted
+        if order is not None:
+            slice_["pinnedOrder"] = order
+        body = json.dumps(cfg, indent=2, ensure_ascii=False)
+        if raw.endswith("\n"):
+            body += "\n"
+        try:
+            tmp = cfg_path + ".tmp-ccmirror"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(body)
+            shutil.copymode(cfg_path, tmp)
+            os.replace(tmp, cfg_path)
+        except OSError:
+            return 0
+    return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="Unify Claude Code sidebars across accounts.")
     ap.add_argument("--list", action="store_true")
@@ -274,7 +372,7 @@ def main():
     ap.add_argument("--no-restore", action="store_true",
                     help="skip reviving dead sessions from the transcript archive")
     ap.add_argument("--no-flag-sync", action="store_true",
-                    help="skip syncing isArchived/title across accounts")
+                    help="skip syncing isArchived/isStarred/title across accounts")
     ap.add_argument("--archive", default=None, metavar="GLOB",
                     help="recursive glob for archived transcripts (default: \"archive\" "
                          "in ~/.claude/cc-mirror.json; no archive -> no revive step)")
@@ -399,7 +497,7 @@ def main():
     #    files on mere focus, so mtimes are noise). Bootstrap (no base, e.g. the
     #    pre-2026-08-05 backlog or a revived dead store): archived-anywhere wins;
     #    divergent titles prefer a manual rename, then the most recently active copy.
-    flag_synced = retitled = t_retitled = 0
+    flag_synced = retitled = t_retitled = state_synced = 0
     if not args.no_flag_sync:
         try:
             with open(STATE) as f:
@@ -420,20 +518,25 @@ def main():
             src_of = lambda d: d.get("titleSource") or "auto"
             act_of = lambda d: d.get("lastActivityAt") or d.get("createdAt") or 0
 
-            vals = {bool(d.get("isArchived")) for _, _, d in copies}
-            if len(vals) == 1:
-                arch = vals.pop()
-            else:
-                b = base.get("isArchived")
-                arch = (not b) if isinstance(b, bool) else True
+            flags = {}
+            for key, on, off in (("isArchived", "archive", "un-archive"),
+                                 ("isStarred", "pin", "unpin")):
+                vals = {bool(d.get(key)) for _, _, d in copies}
+                if len(vals) == 1:
+                    flags[key] = vals.pop()
+                    continue
+                b = base.get(key)
+                v = (not b) if isinstance(b, bool) else True
                 for path, fn, d in copies:
-                    if bool(d.get("isArchived")) != arch:
-                        d["isArchived"] = arch
+                    if bool(d.get(key)) != v:
+                        d[key] = v
                         dirty.add((path, fn))
+                flags[key] = v
                 flag_synced += 1
                 if not args.quiet:
-                    print("  %s everywhere: %r" % ("archive" if arch else "un-archive",
+                    print("  %s everywhere: %r" % (on if v else off,
                                                    title_of(copies[0][2])[:60]))
+            arch = flags["isArchived"]
 
             title = None
             tvals = {(title_of(d), src_of(d)) for _, _, d in copies}
@@ -487,7 +590,37 @@ def main():
                 if not args.quiet:
                     print("  transcript title everywhere: %r" % tt[:60])
 
-            rec = {"isArchived": arch}
+            changed = False
+            w = max((d for _, _, d in copies),
+                    key=lambda d: (act_of(d), d.get("completedTurns") or 0))
+            for path, fn, d in copies:
+                if d is w or act_of(d) >= act_of(w):
+                    continue
+                for key in PROGRESS_KEYS:
+                    if key in w and d.get(key) != w[key]:
+                        d[key] = w[key]
+                        dirty.add((path, fn))
+                        changed = True
+
+            sbase = base.get("settings") or {}
+            srec = {}
+            for key in SETTING_KEYS:
+                hashes = [(value_hash(d.get(key)), d) for _, _, d in copies]
+                if len({h for h, _ in hashes}) > 1:
+                    cands = [d for h, d in hashes if h != sbase.get(key)] or [d for _, d in hashes]
+                    v = max(cands, key=act_of).get(key)
+                    for path, fn, d in copies:
+                        if d.get(key) != v and not (v is None and key not in d):
+                            d[key] = v
+                            dirty.add((path, fn))
+                    changed = True
+                    srec[key] = value_hash(v)
+                else:
+                    srec[key] = hashes[0][0]
+            if changed:
+                state_synced += 1
+
+            rec = {"isArchived": arch, "isStarred": flags["isStarred"], "settings": srec}
             if title is not None:
                 rec["title"] = title
             if tt is not None:
@@ -520,6 +653,10 @@ def main():
             except OSError:
                 pass
 
+    pin_list = 0
+    if not args.no_flag_sync:
+        pin_list = sync_starred_list(folders, args.dry_run)
+
     # 2) Optional cleanup: remove DEAD (transcript-pruned) sessions spread to non-home
     #    accounts. Off by default — the Claude app prunes these itself on load.
     if args.prune:
@@ -539,9 +676,10 @@ def main():
 
     verb = "Would" if args.dry_run else ""
     summary = (f"added {added}, repaired {fixed}, revived {revived}, pruned {pruned}, "
-               f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}")
+               f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}, "
+               f"state-synced {state_synced}, pin-list {pin_list}")
     if args.quiet:
-        if added or fixed or pruned or revived or flag_synced or retitled or t_retitled:
+        if added or fixed or pruned or revived or flag_synced or retitled or t_retitled or state_synced or pin_list:
             print(f"cc-mirror-sessions: {summary}")
     else:
         print(f"\n{(verb + ' ') if verb else ''}{'add/repair/prune' if verb else 'Done'}: {summary}\n")
