@@ -75,6 +75,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import time
 
@@ -273,6 +274,440 @@ def restore_dead(folder_files, stems, pattern, dry_run):
 CLAUDE_DIR = os.path.join(HOME, "Library", "Application Support", "Claude")
 LS_DIR = os.path.join(CLAUDE_DIR, "Local Storage", "leveldb")
 STARRED_PREF = "starred-local-code-sessions"
+SWIVEL_DIR = os.path.join(HOME, "Library", "Application Support", "Swivel")
+SWIVEL_RUN_WINDOW = 30
+
+
+LS_ORIGIN = b"_https://claude.ai\x00\x01"
+LS_STARRED = LS_ORIGIN + b"LSS-persisted.starred-local-code-sessions"
+LS_SLICE = LS_ORIGIN + b"LSS-persisted.dframe-local-slice"
+LS_STORE = LS_ORIGIN + b"dframe-store"
+LS_PIN_KEYS = (LS_STARRED, LS_SLICE, LS_STORE)
+LOG_BLOCK = 32768
+LOG_HEADER = 7
+
+
+def varint(buf, pos):
+    result = shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return result, pos
+        shift += 7
+
+
+def put_varint(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _crc32c_table():
+    table = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+        table.append(c)
+    return table
+
+
+CRC32C_TABLE = _crc32c_table()
+
+
+def crc32c(data):
+    c = 0xFFFFFFFF
+    for b in data:
+        c = CRC32C_TABLE[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c ^ 0xFFFFFFFF
+
+
+def masked_crc(data):
+    c = crc32c(data)
+    return (((c >> 15) | (c << 17)) + 0xA282EAD8) & 0xFFFFFFFF
+
+
+def snappy_decompress(buf):
+    size, pos = varint(buf, 0)
+    out = bytearray()
+    while pos < len(buf):
+        tag = buf[pos]
+        pos += 1
+        kind = tag & 3
+        if kind == 0:
+            n = tag >> 2
+            if n >= 60:
+                extra = n - 59
+                n = int.from_bytes(buf[pos:pos + extra], "little")
+                pos += extra
+            n += 1
+            out += buf[pos:pos + n]
+            pos += n
+            continue
+        if kind == 1:
+            length = ((tag >> 2) & 7) + 4
+            offset = ((tag >> 5) << 8) | buf[pos]
+            pos += 1
+        elif kind == 2:
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(buf[pos:pos + 2], "little")
+            pos += 2
+        else:
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(buf[pos:pos + 4], "little")
+            pos += 4
+        start = len(out) - offset
+        for i in range(length):
+            out.append(out[start + i])
+    if len(out) != size:
+        raise ValueError("snappy size mismatch")
+    return bytes(out)
+
+
+def _read_block(data, offset, size):
+    raw = data[offset:offset + size]
+    return snappy_decompress(raw) if data[offset + size] == 1 else raw
+
+
+def _block_entries(block):
+    restarts = struct.unpack_from("<I", block, len(block) - 4)[0]
+    limit = len(block) - 4 - 4 * restarts
+    pos, key = 0, b""
+    while pos < limit:
+        shared, pos = varint(block, pos)
+        unshared, pos = varint(block, pos)
+        vlen, pos = varint(block, pos)
+        key = key[:shared] + block[pos:pos + unshared]
+        pos += unshared
+        yield key, block[pos:pos + vlen]
+        pos += vlen
+
+
+def sstable_records(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    footer = data[-48:]
+    _, p = varint(footer, 0)
+    _, p = varint(footer, p)
+    idx_off, p = varint(footer, p)
+    idx_size, p = varint(footer, p)
+    for _, handle in _block_entries(_read_block(data, idx_off, idx_size)):
+        off, q = varint(handle, 0)
+        size, _ = varint(handle, q)
+        for ikey, value in _block_entries(_read_block(data, off, size)):
+            if len(ikey) < 8:
+                continue
+            tag = struct.unpack("<Q", ikey[-8:])[0]
+            yield ikey[:-8], tag >> 8, tag & 0xFF, value
+
+
+def log_payloads(data):
+    pos, pending = 0, None
+    while pos + LOG_HEADER <= len(data):
+        left = LOG_BLOCK - pos % LOG_BLOCK
+        if left < LOG_HEADER:
+            pos += left
+            continue
+        length, rtype = struct.unpack_from("<HB", data, pos + 4)
+        payload = data[pos + LOG_HEADER:pos + LOG_HEADER + length]
+        pos += LOG_HEADER + length
+        if rtype == 1:
+            yield payload
+            pending = None
+        elif rtype == 2:
+            pending = payload
+        elif rtype == 3 and pending is not None:
+            pending += payload
+        elif rtype == 4 and pending is not None:
+            yield pending + payload
+            pending = None
+
+
+def log_records(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    for batch in log_payloads(data):
+        if len(batch) < 12:
+            continue
+        seq, count = struct.unpack_from("<QI", batch, 0)
+        p = 12
+        for i in range(count):
+            if p >= len(batch):
+                break
+            kind = batch[p]
+            p += 1
+            klen, p = varint(batch, p)
+            key = batch[p:p + klen]
+            p += klen
+            value = b""
+            if kind == 1:
+                vlen, p = varint(batch, p)
+                value = batch[p:p + vlen]
+                p += vlen
+            yield key, seq + i, kind, value
+
+
+def manifest_last_sequence(ldir):
+    try:
+        with open(os.path.join(ldir, "CURRENT")) as f:
+            name = f.read().strip()
+        with open(os.path.join(ldir, name), "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    last = 0
+    for rec in log_payloads(data):
+        p = 0
+        try:
+            while p < len(rec):
+                tag, p = varint(rec, p)
+                if tag == 1:
+                    n, p = varint(rec, p)
+                    p += n
+                elif tag in (2, 3, 9):
+                    _, p = varint(rec, p)
+                elif tag == 4:
+                    v, p = varint(rec, p)
+                    last = max(last, v)
+                elif tag == 5:
+                    _, p = varint(rec, p)
+                    n, p = varint(rec, p)
+                    p += n
+                elif tag == 6:
+                    _, p = varint(rec, p)
+                    _, p = varint(rec, p)
+                elif tag == 7:
+                    for _ in range(3):
+                        _, p = varint(rec, p)
+                    for _ in range(2):
+                        n, p = varint(rec, p)
+                        p += n
+                else:
+                    break
+        except IndexError:
+            continue
+    return last
+
+
+def file_number(path):
+    try:
+        return int(os.path.basename(path).split(".")[0])
+    except ValueError:
+        return -1
+
+
+def ls_read(ldir, keys):
+    best, max_seq = {}, manifest_last_sequence(ldir)
+    paths = glob.glob(os.path.join(ldir, "*.ldb")) + glob.glob(os.path.join(ldir, "*.log"))
+    for path in paths:
+        reader = sstable_records if path.endswith(".ldb") else log_records
+        for key, seq, kind, value in reader(path):
+            max_seq = max(max_seq, seq)
+            if key in keys and (key not in best or seq > best[key][0]):
+                best[key] = (seq, kind, value)
+    return best, max_seq
+
+
+def ls_decode(rec):
+    if rec is None or rec[1] != 1 or not rec[2]:
+        return None
+    raw = rec[2]
+    text = raw[1:].decode("latin-1") if raw[0] == 1 else raw[1:].decode("utf-16-le")
+    return json.loads(text)
+
+
+def ls_encode(obj):
+    return b"\x01" + json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("latin-1")
+
+
+def ls_append_batch(log_path, seq, puts):
+    batch = bytearray(struct.pack("<QI", seq, len(puts)))
+    for key, value in puts:
+        batch += b"\x01" + put_varint(len(key)) + key + put_varint(len(value)) + value
+    pos = os.path.getsize(log_path)
+    out, left, first = bytearray(), bytes(batch), True
+    while True:
+        room = LOG_BLOCK - pos % LOG_BLOCK
+        if room < LOG_HEADER:
+            out += b"\x00" * room
+            pos += room
+            room = LOG_BLOCK
+        frag, left = left[:room - LOG_HEADER], left[room - LOG_HEADER:]
+        end = not left
+        rtype = (1 if end else 2) if first else (4 if end else 3)
+        out += struct.pack("<IHB", masked_crc(bytes([rtype]) + frag), len(frag), rtype) + frag
+        pos += LOG_HEADER + len(frag)
+        first = False
+        if end:
+            break
+    with open(log_path, "ab") as f:
+        f.write(out)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+IDB_REL = os.path.join("IndexedDB", "https_claude.ai_0.indexeddb.leveldb")
+IDB_PIN_NAME = "store:pin-state:dframe-starred-code".encode("utf-16-be")
+
+
+def idb_parse(value):
+    ver, p = varint(value, 0)
+    if value[p] != 0xFF:
+        return None
+    _, p = varint(value, p + 1)
+    if value[p] == 0xFE:
+        p += 13
+    if value[p] != 0xFF:
+        return None
+    _, p = varint(value, p + 1)
+    tag = value[p]
+    n, q = varint(value, p + 1)
+    if tag == 0x22:
+        text = value[q:q + n].decode("latin-1")
+    elif tag == 0x63:
+        text = value[q:q + n].decode("utf-16-le")
+    else:
+        return None
+    return value[:p], json.loads(text)
+
+
+def idb_pin_record(ddir):
+    latest, max_seq = {}, manifest_last_sequence(ddir)
+    paths = glob.glob(os.path.join(ddir, "*.ldb")) + glob.glob(os.path.join(ddir, "*.log"))
+    for path in paths:
+        reader = sstable_records if path.endswith(".ldb") else log_records
+        for key, seq, kind, value in reader(path):
+            max_seq = max(max_seq, seq)
+            if IDB_PIN_NAME in key and (key not in latest or seq > latest[key][0]):
+                latest[key] = (seq, kind, value)
+    for key, (seq, kind, value) in latest.items():
+        if kind != 1 or len(value) < 20:
+            continue
+        try:
+            parsed = idb_parse(value)
+        except Exception:
+            continue
+        if parsed and isinstance(parsed[1], dict) and isinstance(parsed[1].get("state"), dict):
+            return key, parsed[0], parsed[1], max_seq
+    return None
+
+
+def idb_pin_list(ddir):
+    try:
+        rec = idb_pin_record(ddir)
+    except Exception:
+        return None
+    ids = rec[2]["state"].get("starredIds") if rec else None
+    return [x for x in ids if isinstance(x, str)] if isinstance(ids, list) else None
+
+
+def sync_idb_pins(ddir, wanted, dry_run, now_ms=None):
+    logs = sorted(glob.glob(os.path.join(ddir, "*.log")), key=file_number)
+    if not logs:
+        return 0
+    try:
+        rec = idb_pin_record(ddir)
+    except Exception:
+        return 0
+    if rec is None:
+        return 0
+    key, prefix, obj, max_seq = rec
+    if obj["state"].get("starredIds") == wanted:
+        return 0
+    obj["state"]["starredIds"] = list(wanted)
+    if "updatedAt" in obj:
+        obj["updatedAt"] = now_ms or int(time.time() * 1000)
+    text = json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("latin-1")
+    value = prefix + b"\x22" + put_varint(len(text)) + text
+    if dry_run:
+        return 1
+    fd = os.open(os.path.join(ddir, "LOCK"), os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        ls_append_batch(logs[-1], max_seq + 1, [(key, value)])
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return 1
+
+
+def app_pin_list(claude_dir):
+    for reader, rel in ((idb_pin_list, IDB_REL), (ls_pin_list, os.path.join("Local Storage", "leveldb"))):
+        found = reader(os.path.join(claude_dir, rel))
+        if found is not None:
+            return found
+    return None
+
+
+def ls_pin_list(ldir):
+    try:
+        best, _ = ls_read(ldir, (LS_STARRED,))
+        obj = ls_decode(best.get(LS_STARRED))
+    except Exception:
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("value"), list):
+        return [x for x in obj["value"] if isinstance(x, str)]
+    return None
+
+
+def with_appended(order, wanted):
+    return order + ["code:" + n for n in wanted if "code:" + n not in order]
+
+
+def sync_local_storage_pins(ldir, wanted, dry_run, now_ms=None):
+    logs = sorted(glob.glob(os.path.join(ldir, "*.log")), key=file_number)
+    if not logs:
+        return 0
+    try:
+        best, max_seq = ls_read(ldir, LS_PIN_KEYS)
+        starred = ls_decode(best.get(LS_STARRED))
+        slice_ = ls_decode(best.get(LS_SLICE))
+        store = ls_decode(best.get(LS_STORE))
+    except Exception:
+        return 0
+    stamp = now_ms or int(time.time() * 1000)
+    puts = []
+    if best.get(LS_STARRED) and not isinstance(starred, dict):
+        return 0
+    if not isinstance(starred, dict) or starred.get("value") != wanted:
+        obj = dict(starred) if isinstance(starred, dict) else {"value": [], "tabId": ""}
+        obj["value"], obj["timestamp"] = list(wanted), stamp
+        puts.append((LS_STARRED, ls_encode(obj)))
+    value = slice_.get("value") if isinstance(slice_, dict) else None
+    if isinstance(value, dict) and isinstance(value.get("pinnedOrder"), list):
+        order = with_appended(value["pinnedOrder"], wanted)
+        if order != value["pinnedOrder"]:
+            value["pinnedOrder"], slice_["timestamp"] = order, stamp
+            puts.append((LS_SLICE, ls_encode(slice_)))
+    state = store.get("state") if isinstance(store, dict) else None
+    if isinstance(state, dict) and isinstance(state.get("pinnedOrder"), list):
+        order = with_appended(state["pinnedOrder"], wanted)
+        if order != state["pinnedOrder"]:
+            state["pinnedOrder"] = order
+            puts.append((LS_STORE, ls_encode(store)))
+    if not puts:
+        return 0
+    if dry_run:
+        return 1
+    fd = os.open(os.path.join(ldir, "LOCK"), os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        ls_append_batch(logs[-1], max_seq + 1, puts)
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return 1
 
 
 def claude_running(ldir=None):
@@ -337,8 +772,11 @@ def sync_starred_list(folders, dry_run, claude_dir=None, ldir=None):
         order = cur_order + ["code:" + n for n in wanted if "code:" + n not in cur_order]
         if order == cur_order:
             order = None
+    ls_changed = sync_local_storage_pins(ldir or os.path.join(cdir, "Local Storage", "leveldb"),
+                                         wanted, dry_run)
+    ls_changed = sync_idb_pins(os.path.join(cdir, IDB_REL), wanted, dry_run) or ls_changed
     if wanted == current and order is None:
-        return 0
+        return ls_changed
     if not dry_run:
         prefs[STARRED_PREF] = wanted
         if order is not None:
@@ -353,8 +791,64 @@ def sync_starred_list(folders, dry_run, claude_dir=None, ldir=None):
             shutil.copymode(cfg_path, tmp)
             os.replace(tmp, cfg_path)
         except OSError:
-            return 0
+            return ls_changed
     return 1
+
+
+def outgoing_pin_list(now=None):
+    state_path = os.path.join(SWIVEL_DIR, "state.json")
+    try:
+        age = (now or time.time()) - os.path.getmtime(state_path)
+        with open(state_path) as f:
+            state = json.load(f)
+    except Exception:
+        return None
+    prev, active = state.get("previousProfile"), state.get("activeProfile")
+    if not prev or prev == active or not 0 <= age <= SWIVEL_RUN_WINDOW:
+        return None
+    if claude_running(LS_DIR):
+        return None
+    snap = os.path.join(SWIVEL_DIR, "profiles", prev, "Claude")
+    try:
+        with open(os.path.join(snap, "config.json")) as f:
+            acct = json.load(f).get("lastKnownAccountUuid") or ""
+        with open(os.path.join(CLAUDE_DIR, "config.json")) as f:
+            live = json.load(f).get("lastKnownAccountUuid") or ""
+        starred = app_pin_list(snap)
+        if starred is None:
+            with open(os.path.join(snap, "claude_desktop_config.json"), encoding="utf-8") as f:
+                starred = json.load(f)["preferences"]["epitaxyPrefs"].get(STARRED_PREF)
+    except Exception:
+        return None
+    if not acct or acct == live or not isinstance(starred, list):
+        return None
+    return acct, {x for x in starred if isinstance(x, str)}
+
+
+def seed_starred_from_list(folder_files, folders, acct, starred, dry_run):
+    seeded = 0
+    for a, _, path in folders:
+        if a != acct:
+            continue
+        for fn, d in folder_files[path].items():
+            want = fn[:-5] in starred
+            if bool(d.get("isStarred")) == want:
+                continue
+            d["isStarred"] = want
+            seeded += 1
+            if dry_run:
+                continue
+            fp = os.path.join(path, fn)
+            try:
+                mt = os.path.getmtime(fp)
+                tmp = fp + ".tmp-pinseed"
+                with open(tmp, "w") as f:
+                    json.dump(d, f, separators=(",", ":"), ensure_ascii=False)
+                os.replace(tmp, fp)
+                os.utime(fp, (mt, mt))
+            except OSError:
+                continue
+    return seeded
 
 
 def main():
@@ -437,6 +931,12 @@ def main():
                 clis.add(cli)
         folder_files[path] = files
         folder_clis[path] = clis
+
+    seeded = 0
+    if not args.no_flag_sync:
+        outgoing = outgoing_pin_list()
+        if outgoing:
+            seeded = seed_starred_from_list(folder_files, folders, outgoing[0], outgoing[1], args.dry_run)
 
     # 0) Revive dead sessions whose transcript survives in the archive. Mutates
     #    `stems`, so the steps below treat revived sessions as openable and
@@ -677,9 +1177,10 @@ def main():
     verb = "Would" if args.dry_run else ""
     summary = (f"added {added}, repaired {fixed}, revived {revived}, pruned {pruned}, "
                f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}, "
-               f"state-synced {state_synced}, pin-list {pin_list}")
+               f"state-synced {state_synced}, pin-list {pin_list}, pin-seeded {seeded}")
     if args.quiet:
-        if added or fixed or pruned or revived or flag_synced or retitled or t_retitled or state_synced or pin_list:
+        if (added or fixed or pruned or revived or flag_synced or retitled or t_retitled or state_synced
+                or pin_list or seeded):
             print(f"cc-mirror-sessions: {summary}")
     else:
         print(f"\n{(verb + ' ') if verb else ''}{'add/repair/prune' if verb else 'Done'}: {summary}\n")
