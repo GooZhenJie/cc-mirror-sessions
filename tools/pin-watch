@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+import argparse
+import glob
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CLAUDE = os.path.join(HOME, "Library", "Application Support", "Claude")
+SWIVEL = os.path.join(HOME, "Library", "Application Support", "Swivel")
+LS_DIR = os.path.join(CLAUDE, "Local Storage", "leveldb")
+DEFAULT_LOG = os.path.join(HOME, "Library", "Logs", "cc-mirror-pin-watch.log")
+LS_KEYS = {
+    b"_https://claude.ai\x00\x01LSS-persisted.starred-local-code-sessions": "ls.starred",
+    b"_https://claude.ai\x00\x01LSS-persisted.dframe-local-slice": "ls.slice",
+}
+
+
+def varint(buf, pos):
+    result = shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return result, pos
+        shift += 7
+
+
+def snappy_decompress(buf):
+    size, pos = varint(buf, 0)
+    out = bytearray()
+    while pos < len(buf):
+        tag = buf[pos]
+        pos += 1
+        kind = tag & 3
+        if kind == 0:
+            n = tag >> 2
+            if n >= 60:
+                extra = n - 59
+                n = int.from_bytes(buf[pos:pos + extra], "little")
+                pos += extra
+            n += 1
+            out += buf[pos:pos + n]
+            pos += n
+            continue
+        if kind == 1:
+            length = ((tag >> 2) & 7) + 4
+            offset = ((tag >> 5) << 8) | buf[pos]
+            pos += 1
+        elif kind == 2:
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(buf[pos:pos + 2], "little")
+            pos += 2
+        else:
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(buf[pos:pos + 4], "little")
+            pos += 4
+        start = len(out) - offset
+        for i in range(length):
+            out.append(out[start + i])
+    if len(out) != size:
+        raise ValueError("snappy size mismatch")
+    return bytes(out)
+
+
+def read_block(data, offset, size):
+    raw = data[offset:offset + size]
+    kind = data[offset + size]
+    return snappy_decompress(raw) if kind == 1 else raw
+
+
+def block_entries(block):
+    restarts = struct.unpack_from("<I", block, len(block) - 4)[0]
+    limit = len(block) - 4 - 4 * restarts
+    pos, key = 0, b""
+    while pos < limit:
+        shared, pos = varint(block, pos)
+        unshared, pos = varint(block, pos)
+        vlen, pos = varint(block, pos)
+        key = key[:shared] + block[pos:pos + unshared]
+        pos += unshared
+        yield key, block[pos:pos + vlen]
+        pos += vlen
+
+
+def sstable_records(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    footer = data[-48:]
+    _, p = varint(footer, 0)
+    _, p = varint(footer, p)
+    idx_off, p = varint(footer, p)
+    idx_size, p = varint(footer, p)
+    for _, handle in block_entries(read_block(data, idx_off, idx_size)):
+        off, q = varint(handle, 0)
+        size, _ = varint(handle, q)
+        for ikey, value in block_entries(read_block(data, off, size)):
+            if len(ikey) < 8:
+                continue
+            tag = struct.unpack("<Q", ikey[-8:])[0]
+            yield ikey[:-8], tag >> 8, tag & 0xFF, value
+
+
+def log_records(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    pos, pending = 0, b""
+    while pos + 7 <= len(data):
+        block_left = 32768 - pos % 32768
+        if block_left < 7:
+            pos += block_left
+            continue
+        length, rtype = struct.unpack_from("<HB", data, pos + 4)
+        payload = data[pos + 7:pos + 7 + length]
+        pos += 7 + length
+        if rtype == 0 and length == 0:
+            continue
+        if rtype == 1:
+            pending = payload
+        elif rtype == 2:
+            pending = payload
+            continue
+        elif rtype == 3:
+            pending += payload
+            continue
+        elif rtype == 4:
+            pending += payload
+        else:
+            continue
+        batch, pending = pending, b""
+        if len(batch) < 12:
+            continue
+        seq, count = struct.unpack_from("<QI", batch, 0)
+        p = 12
+        for i in range(count):
+            if p >= len(batch):
+                break
+            kind = batch[p]
+            p += 1
+            klen, p = varint(batch, p)
+            key = batch[p:p + klen]
+            p += klen
+            value = b""
+            if kind == 1:
+                vlen, p = varint(batch, p)
+                value = batch[p:p + vlen]
+                p += vlen
+            yield key, seq + i, kind, value
+
+
+FILE_CACHE = {}
+
+
+def file_hits(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = FILE_CACHE.get(path)
+    if cached and cached[0] == sig:
+        return cached[1]
+    reader = sstable_records if path.endswith(".ldb") else log_records
+    hits = {}
+    try:
+        for key, seq, kind, value in reader(path):
+            if key in LS_KEYS and (key not in hits or seq > hits[key][0]):
+                hits[key] = (seq, kind, value)
+    except Exception:
+        pass
+    FILE_CACHE[path] = (sig, hits)
+    return hits
+
+
+def read_local_storage(ldir=LS_DIR):
+    best = {}
+    files = glob.glob(os.path.join(ldir, "*.ldb")) + glob.glob(os.path.join(ldir, "*.log"))
+    for path in files:
+        for key, rec in file_hits(path).items():
+            if key not in best or rec[0] > best[key][0]:
+                best[key] = rec
+    out = {}
+    for key, name in LS_KEYS.items():
+        if key not in best:
+            out[name] = None
+            continue
+        seq, kind, value = best[key]
+        if kind != 1:
+            out[name] = {"seq": seq, "deleted": True}
+            continue
+        try:
+            obj = json.loads(value[1:].decode("utf-8"))
+        except Exception:
+            out[name] = {"seq": seq, "unparsed": True}
+            continue
+        val = obj.get("value")
+        if name == "ls.slice" and isinstance(val, dict):
+            val = val.get("pinnedOrder")
+        out[name] = {"seq": seq, "ts": obj.get("timestamp"), "value": val}
+    return out
+
+
+def idb_starred():
+    try:
+        import importlib.machinery
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cc-mirror-sessions")
+        loader = importlib.machinery.SourceFileLoader("ccm_watch", path)
+        spec = importlib.util.spec_from_loader("ccm_watch", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        rec = mod.idb_pin_record(os.path.join(CLAUDE, mod.IDB_REL))
+    except Exception as e:
+        return {"error": str(e)}
+    if rec is None:
+        return None
+    _, _, obj, _ = rec
+    return {"updatedAt": obj.get("updatedAt"), "value": short(obj["state"].get("starredIds"))}
+
+
+def short(ids):
+    if not isinstance(ids, list):
+        return ids
+    return [x.split("local_")[-1][:8] for x in ids if isinstance(x, str)]
+
+
+def claude_running():
+    try:
+        out = subprocess.run(["ps", "-axo", "comm="], stdout=subprocess.PIPE,
+                             universal_newlines=True).stdout
+        return any(line.strip().endswith("Claude.app/Contents/MacOS/Claude") for line in out.splitlines())
+    except Exception:
+        return None
+
+
+def load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def snapshot():
+    cfg = load_json(os.path.join(CLAUDE, "claude_desktop_config.json")) or {}
+    prefs = cfg.get("preferences", {}).get("epitaxyPrefs", {})
+    acct = (load_json(os.path.join(CLAUDE, "config.json")) or {}).get("lastKnownAccountUuid")
+    state = load_json(os.path.join(SWIVEL, "state.json")) or {}
+    mirror = load_json(os.path.join(SWIVEL, "session-mirror.json")) or {}
+    ls = read_local_storage()
+    idb = idb_starred()
+    return {
+        "claude": claude_running(),
+        "account": (acct or "")[:8],
+        "swivel": "%s<-%s" % (state.get("activeProfile"), state.get("previousProfile")),
+        "mirror": "%s %s" % (mirror.get("at"), (mirror.get("summary") or "").split(": ")[-1]),
+        "cfg.starred": short(prefs.get("starred-local-code-sessions")),
+        "cfg.order": short((prefs.get("dframe-local-slice") or {}).get("pinnedOrder")),
+        "ls.starred": dict((ls["ls.starred"] or {}), value=short((ls["ls.starred"] or {}).get("value"))),
+        "ls.order": dict((ls["ls.slice"] or {}), value=short((ls["ls.slice"] or {}).get("value"))),
+        "idb.starred": idb,
+    }
+
+
+def stamp():
+    t = time.time()
+    return time.strftime("%H:%M:%S", time.localtime(t)) + ".%03d" % int((t % 1) * 1000)
+
+
+def watch(args):
+    prev = {}
+    deadline = time.time() + args.max_minutes * 60
+    with open(args.log, "a", encoding="utf-8") as out:
+        out.write("\n==== pin-watch start %s pid %d ====\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid()))
+        out.flush()
+        while time.time() < deadline:
+            cur = snapshot()
+            changed = {k: v for k, v in cur.items() if prev.get(k) != v}
+            if changed:
+                out.write("%s %s\n" % (stamp(), json.dumps(changed, ensure_ascii=False)))
+                out.flush()
+            prev = cur
+            time.sleep(args.interval)
+        out.write("==== pin-watch stop %s ====\n" % time.strftime("%H:%M:%S"))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Log every change to the sidebar pin state across a Swivel switch.")
+    ap.add_argument("--log", default=DEFAULT_LOG)
+    ap.add_argument("--interval", type=float, default=0.2)
+    ap.add_argument("--max-minutes", type=float, default=15)
+    ap.add_argument("--once", action="store_true", help="print the current state and exit")
+    ap.add_argument("--detach", action="store_true", help="keep running after this terminal or Claude quits")
+    args = ap.parse_args()
+    if args.once:
+        print(json.dumps(snapshot(), ensure_ascii=False, indent=2))
+        return 0
+    if args.detach:
+        if os.fork():
+            print("pin-watch running in background, log: %s" % args.log)
+            return 0
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    return watch(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

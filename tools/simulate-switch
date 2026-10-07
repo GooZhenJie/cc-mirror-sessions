@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+import argparse
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+CLAUDE = os.path.join(HOME, "Library", "Application Support", "Claude")
+SWIVEL = os.path.join(HOME, "Library", "Application Support", "Swivel")
+SESSIONS = os.path.join(CLAUDE, "claude-code-sessions")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+MIRROR_STATE = os.path.join(HOME, ".claude", "cc-mirror-state.json")
+MIRROR_CONFIG = os.path.join(HOME, ".claude", "cc-mirror.json")
+DEFAULT_SCRIPT = os.path.join(HOME, "bin", "cc-mirror-sessions")
+DEFAULT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pin-template.json")
+STARRED = "starred-local-code-sessions"
+GUARDED = ("claude_desktop_config.json", "config.json")
+LS_REL = os.path.join("Local Storage", "leveldb")
+REPO_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cc-mirror-sessions")
+
+
+def load_mirror(path=REPO_SCRIPT):
+    loader = importlib.machinery.SourceFileLoader("cc_mirror_sessions", path)
+    spec = importlib.util.spec_from_loader("cc_mirror_sessions", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+MIRROR = load_mirror()
+
+
+def ls_list(claude_dir):
+    return MIRROR.ls_pin_list(os.path.join(claude_dir, LS_REL))
+
+
+def idb_list(claude_dir):
+    return MIRROR.idb_pin_list(os.path.join(claude_dir, MIRROR.IDB_REL))
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def account_of(claude_dir):
+    return load_json(os.path.join(claude_dir, "config.json")).get("lastKnownAccountUuid") or ""
+
+
+def prefs_of(claude_dir):
+    cfg = load_json(os.path.join(claude_dir, "claude_desktop_config.json"))
+    return cfg.get("preferences", {}).get("epitaxyPrefs", {})
+
+
+def pin_lists(prefs):
+    starred = [x for x in prefs.get(STARRED, []) if isinstance(x, str)]
+    order = (prefs.get("dframe-local-slice") or {}).get("pinnedOrder") or []
+    return starred, [x for x in order if isinstance(x, str)]
+
+
+def activity_days(prefs, acct):
+    v = prefs.get("code-sessions-state-activity-days.%s" % acct)
+    return v if isinstance(v, (int, float)) and v > 0 else 0
+
+
+def index_copies(sessions_dir, sid, acct=None):
+    pattern = os.path.join(sessions_dir, acct or "*", "*", sid + ".json")
+    out = []
+    for fp in glob.glob(pattern):
+        try:
+            out.append((fp, load_json(fp)))
+        except Exception:
+            pass
+    return out
+
+
+def title_of(sid, sessions_dir=SESSIONS):
+    for _, d in index_copies(sessions_dir, sid):
+        if d.get("title"):
+            return d["title"]
+    return "?"
+
+
+def visible_pins(prefs, acct, sessions_dir=SESSIONS, now_ms=None):
+    starred, _ = pin_lists(prefs)
+    days = activity_days(prefs, acct)
+    now_ms = now_ms or int(time.time() * 1000)
+    out = []
+    for sid in starred:
+        copies = index_copies(sessions_dir, sid, acct)
+        if not copies:
+            continue
+        d = max((c[1] for c in copies), key=lambda x: x.get("lastActivityAt") or 0)
+        if d.get("isArchived"):
+            continue
+        if days and (d.get("lastActivityAt") or 0) < now_ms - days * 86400000:
+            continue
+        out.append(sid)
+    return out, days
+
+
+def profile_dir(name):
+    return os.path.join(SWIVEL, "profiles", name, "Claude")
+
+
+def live_profile():
+    try:
+        return load_json(os.path.join(SWIVEL, "state.json")).get("activeProfile")
+    except Exception:
+        return None
+
+
+def fingerprint(paths):
+    out = {}
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                out[p] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            out[p] = None
+    return out
+
+
+def build_sandbox(root):
+    claude = os.path.join(root, "Library", "Application Support", "Claude")
+    os.makedirs(os.path.join(claude, "Local Storage", "leveldb"))
+    open(os.path.join(claude, "Local Storage", "leveldb", "LOCK"), "w").close()
+    shutil.copytree(SESSIONS, os.path.join(claude, "claude-code-sessions"), symlinks=True)
+    dot = os.path.join(root, ".claude")
+    os.makedirs(dot)
+    os.symlink(PROJECTS, os.path.join(dot, "projects"))
+    for src in (MIRROR_STATE, MIRROR_CONFIG):
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dot, os.path.basename(src)))
+    return claude
+
+
+def restore_profile(sandbox_claude, source_claude):
+    for name in GUARDED:
+        shutil.copy2(os.path.join(source_claude, name), os.path.join(sandbox_claude, name))
+    for rel in (LS_REL, MIRROR.IDB_REL):
+        src = os.path.join(source_claude, rel)
+        dst = os.path.join(sandbox_claude, rel)
+        if os.path.isdir(src):
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst)
+
+
+def swivel_switch(root, sandbox_claude, outgoing, outgoing_src, target, target_src):
+    swivel = os.path.join(root, "Library", "Application Support", "Swivel")
+    snap = os.path.join(swivel, "profiles", outgoing, "Claude")
+    os.makedirs(snap, exist_ok=True)
+    restore_profile(snap, outgoing_src)
+    restore_profile(sandbox_claude, target_src)
+    with open(os.path.join(swivel, "state.json"), "w") as f:
+        json.dump({"activeProfile": target, "previousProfile": outgoing}, f)
+
+
+def run_mirror(script, root):
+    env = dict(os.environ, HOME=root)
+    proc = subprocess.run(["/usr/bin/python3", script, "--no-restore"], env=env,
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+    summary = [ln.strip() for ln in proc.stdout.splitlines() if "pin-list" in ln]
+    return proc.returncode, summary[-1] if summary else proc.stdout.strip()[-300:]
+
+
+def check(claude, template, label, sessions_dir):
+    acct = account_of(claude)
+    prefs = prefs_of(claude)
+    starred, order = pin_lists(prefs)
+    ls = ls_list(claude)
+    idb = idb_list(claude)
+    shown, days = visible_pins(prefs, acct, sessions_dir)
+    print("\n[%s] account %s, activity filter: %s" % (label, acct[:8], ("%d days" % days) if days else "off"))
+    ok = True
+    for sid in template:
+        copies = index_copies(sessions_dir, sid, acct)
+        has_index = bool(copies)
+        starred_flag = any(d.get("isStarred") for _, d in copies)
+        in_list = sid in starred
+        in_ls = ls is not None and sid in ls
+        in_idb = idb is not None and sid in idb
+        in_order = ("code:" + sid) in order
+        visible = sid in shown
+        passed = has_index and in_list and in_ls and in_idb
+        ok = ok and passed
+        print("  %s %s  index=%s isStarred=%s config=%s localStorage=%s IndexedDB=%s pinnedOrder=%s visible=%s" % (
+            "PASS" if passed else "FAIL", title_of(sid)[:40].ljust(40),
+            yn(has_index), yn(starred_flag), yn(in_list), yn(in_ls), yn(in_idb), yn(in_order), yn(visible)))
+    for name, other in (("localStorage", ls), ("IndexedDB", idb)):
+        if other is not None and other != starred:
+            ok = False
+            print("  FAIL config pin list != %s pin list" % name)
+    truth = idb if idb is not None else (ls if ls is not None else starred)
+    extra = [s for s in truth if s not in template]
+    if extra:
+        print("  also pinned here (%d, not in template):" % len(extra))
+        for sid in extra:
+            vis = "visible" if sid in shown else "hidden by filter"
+            print("    - %s (%s)" % (title_of(sid, sessions_dir)[:50], vis))
+    return ok
+
+
+def compare_lists(expected, claude, source_name, sessions_dir):
+    got = set(MIRROR.app_pin_list(claude) or pin_lists(prefs_of(claude))[0])
+    acct = account_of(claude)
+    known = {os.path.basename(p)[:-5] for p in glob.glob(os.path.join(sessions_dir, acct, "*", "local_*.json"))}
+    expected = {x for x in expected if x in known}
+    got = {x for x in got if x in known}
+    if got == expected:
+        print("  pin list == %s's pin list (%d sessions)" % (source_name, len(got)))
+        return True
+    for sid in sorted(expected - got):
+        print("  MISSING vs %s: %s" % (source_name, title_of(sid, sessions_dir)))
+    for sid in sorted(got - expected):
+        print("  EXTRA vs %s: %s" % (source_name, title_of(sid, sessions_dir)))
+    return False
+
+
+def yn(v):
+    return "Y" if v else "n"
+
+
+def cmd_simulate(args):
+    src_profile = live_profile()
+    if not src_profile:
+        sys.exit("Cannot read Swivel state.json activeProfile.")
+    target = args.to or ("Personal" if src_profile != "Personal" else "RAS")
+    if target == src_profile:
+        sys.exit("Target profile is already the active one.")
+    if not os.path.isdir(profile_dir(target)):
+        sys.exit("No Swivel profile snapshot for %s at %s" % (target, profile_dir(target)))
+
+    live_acct = account_of(CLAUDE)
+    live_prefs = prefs_of(CLAUDE)
+    if args.pins:
+        template = ["local_" + p if not p.startswith("local_") else p for p in args.pins]
+        template = [full_id(p) for p in template]
+    else:
+        template, _ = visible_pins(live_prefs, live_acct)
+    print("Live profile %s (account %s). Template = %d pin(s) visible in the live sidebar:" % (
+        src_profile, live_acct[:8], len(template)))
+    for sid in template:
+        print("  - %s  %s" % (sid[:14], title_of(sid)))
+
+    guarded = [os.path.join(CLAUDE, n) for n in GUARDED] + [MIRROR_STATE]
+    guarded += glob.glob(os.path.join(SWIVEL, "profiles", "*", "Claude", "claude_desktop_config.json"))
+    before = fingerprint(guarded)
+    session_mtime = max(os.path.getmtime(p) for p in glob.glob(os.path.join(SESSIONS, "*", "*", "*.json")))
+
+    base = args.workdir or tempfile.gettempdir()
+    root = tempfile.mkdtemp(prefix="swivel-sim-", dir=base)
+    try:
+        sandbox = build_sandbox(root)
+        sandbox_sessions = os.path.join(sandbox, "claude-code-sessions")
+        live_snapshot = tempfile.mkdtemp(prefix="live-", dir=root)
+        restore_profile(live_snapshot, CLAUDE)
+        live_list = set(MIRROR.app_pin_list(CLAUDE) or pin_lists(live_prefs)[0])
+
+        print("\nStep 1  Swivel: save %s, restore %s's claude_desktop_config.json + config.json" % (src_profile, target))
+        swivel_switch(root, sandbox, src_profile, CLAUDE, target, profile_dir(target))
+        code, summary = run_mirror(args.script, root)
+        print("Step 2  cc-mirror-sessions exit %d: %s" % (code, summary))
+        ok = check(sandbox, template, "after switch to %s" % target, sandbox_sessions)
+        ok = compare_lists(live_list, sandbox, src_profile, sandbox_sessions) and ok
+
+        if args.round_trip:
+            target_saved = tempfile.mkdtemp(prefix="target-", dir=root)
+            restore_profile(target_saved, sandbox)
+            target_list = set(MIRROR.app_pin_list(target_saved) or pin_lists(prefs_of(target_saved))[0])
+            print("\nStep 3  Swivel: save %s, restore %s again" % (target, src_profile))
+            swivel_switch(root, sandbox, target, target_saved, src_profile, live_snapshot)
+            code, summary = run_mirror(args.script, root)
+            print("Step 4  cc-mirror-sessions exit %d: %s" % (code, summary))
+            ok = check(sandbox, template, "back in %s" % src_profile, sandbox_sessions) and ok
+            ok = compare_lists(target_list, sandbox, target, sandbox_sessions) and ok
+
+        print("\nRESULT: %s" % ("PASS: template pins present and pin lists match after every switch" if ok
+                                 else "FAIL: see FAIL / MISSING / EXTRA lines above"))
+        print("Scope: this covers Swivel's restore + cc-mirror-sessions only. What the Claude app does with the")
+        print("list after it launches is not simulated; confirm that with --save-template / --check-live.")
+    finally:
+        if args.keep:
+            print("Sandbox kept at %s" % root)
+        else:
+            shutil.rmtree(root, ignore_errors=True)
+
+    after = fingerprint(guarded)
+    changed = [p for p in guarded if before[p] != after[p]]
+    newest = max(os.path.getmtime(p) for p in glob.glob(os.path.join(SESSIONS, "*", "*", "*.json")))
+    if changed or newest > session_mtime:
+        print("\nNOTE: real files changed during the run (the live Claude app writes these on its own):")
+        for p in changed:
+            print("  - %s" % p)
+        if newest > session_mtime:
+            print("  - an index file under claude-code-sessions")
+    else:
+        print("\nReal Claude/Swivel files untouched.")
+    return 0 if ok else 1
+
+
+def full_id(prefix):
+    if len(prefix) >= 42:
+        return prefix
+    hits = {os.path.basename(p)[:-5] for p in glob.glob(os.path.join(SESSIONS, "*", "*", prefix + "*.json"))}
+    if len(hits) != 1:
+        sys.exit("Session id %s matches %d sessions." % (prefix, len(hits)))
+    return hits.pop()
+
+
+def cmd_save_template(args):
+    acct = account_of(CLAUDE)
+    template, days = visible_pins(prefs_of(CLAUDE), acct)
+    data = {"savedAt": time.strftime("%Y-%m-%dT%H:%M:%S"), "profile": live_profile(), "account": acct,
+            "pins": [{"id": s, "title": title_of(s)} for s in template]}
+    with open(args.template, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("Saved %d pin(s) from %s to %s" % (len(template), data["profile"], args.template))
+    for p in data["pins"]:
+        print("  - %s" % p["title"])
+    return 0
+
+
+def cmd_check_live(args):
+    data = load_json(args.template)
+    template = [p["id"] for p in data["pins"]]
+    print("Template from %s (%s), checking live profile %s" % (data["profile"], data["savedAt"], live_profile()))
+    ok = check(CLAUDE, template, "live", SESSIONS)
+    print("\nRESULT: %s" % ("all template pins are pinned in the live app config" if ok else "pins missing in the live app config"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Simulate a Swivel account switch and check that sidebar pins follow.")
+    ap.add_argument("--to", help="Swivel profile to switch to (default: the other profile)")
+    ap.add_argument("--pins", nargs="+", metavar="ID", help="session ids or id prefixes (default: pins visible in the live sidebar)")
+    ap.add_argument("--round-trip", action="store_true", help="also switch back and check again")
+    ap.add_argument("--script", default=DEFAULT_SCRIPT, help="cc-mirror-sessions to test (default: %(default)s)")
+    ap.add_argument("--workdir", help="where to create the sandbox (default: system temp dir)")
+    ap.add_argument("--keep", action="store_true", help="keep the sandbox for inspection")
+    ap.add_argument("--save-template", action="store_true", help="save the live visible pins, then exit")
+    ap.add_argument("--check-live", action="store_true", help="after a real switch, compare live pins with the saved template")
+    ap.add_argument("--template", default=DEFAULT_TEMPLATE, help="template file (default: %(default)s)")
+    args = ap.parse_args()
+    if args.save_template:
+        return cmd_save_template(args)
+    if args.check_live:
+        return cmd_check_live(args)
+    return cmd_simulate(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
