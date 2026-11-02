@@ -165,6 +165,32 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
   `dframe-pinned-project-outputs`, `dframe-starred-cowork-remote`, …) are not synced either.
 - `local-agent-mode-sessions/<account>/<org>/` is Cowork, not Claude Code; out of scope.
 
+### Scheduled tasks (added 2026-11-02)
+
+Local scheduled tasks are split like sessions: the prompt lives once in
+`~/.claude/scheduled-tasks/<id>/SKILL.md` (shared), while the schedule, on/off switch and last-run
+record live per account in `claude-code-sessions/<account>/<org>/scheduled-tasks.json`. The app
+reads that file only at launch and rewrites it from memory, so only a quit app can be written.
+
+On a Swivel switch, `swivel_switch()` (the same freshness, quit-app and outgoing-account checks the
+pin seeding uses) hands the outgoing and incoming account to `sync_scheduled_tasks()`, which loads
+`~/bin/claude-scheduled-tasks-sync` and calls its `switch_sync()`. That copies the outgoing
+account's tasks and last-run records into the incoming account, so whichever account is open runs a
+task and the other one does not run the same slot again. A task is removed from the incoming
+account only if the outgoing one deleted it since the last sync.
+
+- The sync script is not part of this repo. Its source and rules are the agent-configs skill
+  `claude-desktop-scheduled-tasks-sync`
+  (`/Volumes/T9/Documents/www/agent-configs/shared/common/skills/claude-desktop-scheduled-tasks-sync/`);
+  `~/bin/claude-scheduled-tasks-sync` is a copy of its `sync_scheduled_tasks.py`.
+- Missing script: the step is skipped. Any error: caught, counted as `tasks-sync-failed 1`, and the
+  rest of the run goes on. Summary items: `tasks-synced N`, `tasks-sync-failed N`.
+- Log: `~/Library/Logs/claude-scheduled-tasks-sync.log`. Opt out: `--no-task-sync`.
+- Cloud routines (Scheduled cards without "Only on this computer") are per account on Anthropic's
+  side and are not touched.
+- Verified with a real round-trip switch on 2026-11-02: each direction carried its new tasks and the
+  Scheduled list matched in both accounts.
+
 ### After editing the script
 
 1. Tests on the Python that actually runs it:

@@ -107,6 +107,7 @@ def make_store(m, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "CLAUDE_DIR", str(tmp_path / "no-claude"))
     monkeypatch.setattr(m, "LS_DIR", str(tmp_path / "no-claude" / "ls"))
     monkeypatch.setattr(m, "SWIVEL_DIR", str(tmp_path / "no-swivel"))
+    monkeypatch.setattr(m, "TASK_SYNC_SCRIPT", str(tmp_path / "no-task-sync"))
     return base, proj
 
 
@@ -265,7 +266,7 @@ def test_quiet_summary_keeps_swivel_format(m, tmp_path, monkeypatch, capsys):
     run_main(m, monkeypatch)
     line = capsys.readouterr().out.strip()
     assert line.startswith("cc-mirror-sessions: added 0,")
-    assert line.endswith("state-synced 1, pin-list 0, pin-seeded 0")
+    assert line.endswith("state-synced 1, pin-list 0, pin-seeded 0, tasks-synced 0, tasks-sync-failed 0")
 
 
 def make_claude_dir(tmp_path, acct, starred, order=None, running=False):
@@ -560,3 +561,57 @@ def test_outgoing_list_prefers_indexeddb(m, tmp_path, monkeypatch):
     run_main(m, monkeypatch)
     assert json.loads(a.read_text())["isStarred"] is True
     assert json.loads(b.read_text())["isStarred"] is True
+
+
+def fake_task_sync(tmp_path, monkeypatch, m, body):
+    script = tmp_path / "claude-scheduled-tasks-sync"
+    script.write_text(body)
+    monkeypatch.setattr(m, "TASK_SYNC_SCRIPT", str(script))
+    return tmp_path / "task-sync-calls.json"
+
+
+def test_task_sync_carries_outgoing_account_on_switch(m, tmp_path, monkeypatch, capsys):
+    two_account_store(m, tmp_path, monkeypatch, True)
+    calls = fake_task_sync(tmp_path, monkeypatch, m, (
+        "import json\n"
+        "def switch_sync(source, target, dry_run=False):\n"
+        "    open(%r, 'w').write(json.dumps([source, target, dry_run]))\n"
+        "    return 2\n") % str(tmp_path / "task-sync-calls.json"))
+    make_switch(m, tmp_path, monkeypatch, "acctA", ["local_s1"], "acctB", ["local_s1"])
+    capsys.readouterr()
+    run_main(m, monkeypatch)
+    assert json.loads(calls.read_text()) == ["acctA", "acctB", False]
+    assert "tasks-synced 2, tasks-sync-failed 0" in capsys.readouterr().out
+
+
+def test_task_sync_failure_is_reported_and_pins_still_sync(m, tmp_path, monkeypatch, capsys):
+    a, b = two_account_store(m, tmp_path, monkeypatch, True)
+    fake_task_sync(tmp_path, monkeypatch, m, "def switch_sync(source, target, dry_run=False):\n    raise SystemExit(2)\n")
+    cdir = make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", ["local_s1"])
+    capsys.readouterr()
+    run_main(m, monkeypatch)
+    assert "tasks-synced 0, tasks-sync-failed 1" in capsys.readouterr().out
+    assert json.loads(b.read_text())["isStarred"] is False
+    assert prefs_of(cdir)["epitaxyPrefs"]["starred-local-code-sessions"] == []
+
+
+def test_task_sync_skipped_without_fresh_switch(m, tmp_path, monkeypatch):
+    two_account_store(m, tmp_path, monkeypatch, True)
+    calls = fake_task_sync(tmp_path, monkeypatch, m, (
+        "def switch_sync(source, target, dry_run=False):\n"
+        "    open(%r, 'w').write('called')\n"
+        "    return 1\n") % str(tmp_path / "task-sync-calls.json"))
+    make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", ["local_s1"], age=m.SWIVEL_RUN_WINDOW + 60)
+    run_main(m, monkeypatch)
+    assert not calls.exists()
+
+
+def test_task_sync_skipped_with_flag(m, tmp_path, monkeypatch):
+    two_account_store(m, tmp_path, monkeypatch, True)
+    calls = fake_task_sync(tmp_path, monkeypatch, m, (
+        "def switch_sync(source, target, dry_run=False):\n"
+        "    open(%r, 'w').write('called')\n"
+        "    return 1\n") % str(tmp_path / "task-sync-calls.json"))
+    make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", ["local_s1"])
+    run_main(m, monkeypatch, argv=("--quiet", "--no-task-sync"))
+    assert not calls.exists()
