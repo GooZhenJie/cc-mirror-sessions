@@ -181,7 +181,7 @@ account only if the outgoing one deleted it since the last sync.
 
 - The sync script is not part of this repo. Its source and rules are the agent-configs skill
   `claude-desktop-scheduled-tasks-sync`
-  (`/Volumes/T9/Documents/www/agent-configs/shared/common/skills/claude-desktop-scheduled-tasks-sync/`);
+  (`/Volumes/T9/Documents/www/confstack-data/shared/common/skills/claude-desktop-scheduled-tasks-sync/`);
   `~/bin/claude-scheduled-tasks-sync` is a copy of its `sync_scheduled_tasks.py`.
 - Missing script: the step is skipped. Any error: caught, counted as `tasks-sync-failed 1`, and the
   rest of the run goes on. Summary items: `tasks-synced N`, `tasks-sync-failed N`.
