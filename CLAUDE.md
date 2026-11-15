@@ -160,8 +160,9 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
 ### Other Claude Desktop state
 
 - Other localStorage keys: `epitaxy-folder-permission-mode.<accountUuid>` (per-account folder
-  permission mode), `starred-session-groups`, `dframe-group-scopes` (sidebar groups; empty today).
-  Not synced. Other `pin-state` IndexedDB keys (`dframe-session-groups`,
+  permission mode), `starred-session-groups`, `dframe-group-scopes` (sidebar groups; empty today),
+  `dframe-store.state.customGroupsByScope` (custom groups and their session assignments).
+  Not synced; the sidebar view is, see "Sidebar view" below. Other `pin-state` IndexedDB keys (`dframe-session-groups`,
   `dframe-pinned-project-outputs`, `dframe-starred-cowork-remote`, …) are not synced either.
 - `local-agent-mode-sessions/<account>/<org>/` is Cowork, not Claude Code; out of scope.
 
@@ -190,6 +191,36 @@ account only if the outgoing one deleted it since the last sync.
   side and are not touched.
 - Verified with a real round-trip switch on 2026-11-02: each direction carried its new tasks and the
   Scheduled list matched in both accounts.
+
+### Sidebar view (added 2026-11-15)
+
+The sidebar's view settings (Sessions grouped by folder / date / state, sort order, and the
+shown and collapsed state of each section) are per account, keyed by scope `<account>/<org>`, and
+held in three places inside the Claude folder Swivel swaps:
+
+| # | Store | Location |
+|---|---|---|
+| 1 | localStorage | `dframe-store` → `state.codeSidebarByScope[scope]` (`state.lastSidebarScopeKey` names the live scope) |
+| 2 | localStorage | `LSS-persisted.dframe-code-sections` → `value[scope]` |
+| 3 | config | `claude_desktop_config.json` → `preferences.epitaxyPrefs["dframe-code-sections"][scope]` |
+
+Each value is `{"sections": [...], "migratedFrom": 1, "prefsSeeded": true}`. Built-in sections have
+ids/kinds `pinned`, `routines`, `sessions`; a missing `groupBy` means none. Custom groups add
+`kind: "manual"` sections whose id is the group id. Not in IndexedDB as of 2026-11-15. The legacy
+`dframe-store.state.groupByByMode` is left over from before `migratedFrom: 1` and is not used.
+
+On a Swivel switch (same `swivel_switch()` checks as the pin seeding), `sync_sidebar_view` reads the
+outgoing account's entry from the profile snapshot (store 1, then 2, then 3), and writes the
+incoming account's entry in all three stores: for each built-in section it copies `VIEW_FIELDS`
+(`groupBy`, `sortBy`, `ascending`, `show`, `collapsed`, `shown`), removing a field the source lacks.
+Manual sections are never copied or removed, because custom groups themselves are not synced and a
+copied section would point at a group that does not exist there. With no entry for the incoming
+scope it creates one from the source's built-in sections; the scope comes from
+`lastSidebarScopeKey`, else the only org folder under `claude-code-sessions/<account>/`. The
+outgoing account's view wins every switch. Summary item: `view-synced N`. Opt out: `--no-view-sync`.
+
+`tools/simulate-switch` checks the view in all three stores after each switch. As with pins, it
+cannot show which store the app reads at launch; a real round-trip switch is the proof.
 
 ### After editing the script
 
