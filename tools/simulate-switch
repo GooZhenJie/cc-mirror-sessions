@@ -226,6 +226,35 @@ def compare_lists(expected, claude, source_name, sessions_dir):
     return False
 
 
+def view_fields(entry):
+    if not isinstance(entry, dict):
+        return None
+    return {s.get("id"): {k: s.get(k) for k in MIRROR.VIEW_FIELDS} for s in entry.get("sections", [])
+            if isinstance(s, dict) and s.get("kind") in MIRROR.VIEW_KINDS}
+
+
+def account_view_fields(claude):
+    found = MIRROR.account_view(MIRROR.read_view_stores(claude), account_of(claude))
+    return view_fields(found[1]) if found else None
+
+
+def check_view(claude, expected, source_name):
+    acct = account_of(claude)
+    stores = MIRROR.read_view_stores(claude)
+    ok = True
+    for name, scopes in zip(("localStorage dframe-store", "localStorage dframe-code-sections", "config"),
+                            stores["scopes"]):
+        keys = sorted(k for k in scopes if k.split("/")[0] == acct)
+        key = stores["last"] if stores["last"] in keys else (keys[0] if keys else None)
+        got = view_fields(scopes.get(key)) if key else None
+        passed = expected is not None and got == expected
+        ok = ok and passed
+        sess = (got or {}).get("sessions") or {}
+        print("  %s sidebar view in %s == %s's: sessions groupBy=%s sortBy=%s" % (
+            "PASS" if passed else "FAIL", name, source_name, sess.get("groupBy"), sess.get("sortBy")))
+    return ok
+
+
 def yn(v):
     return "Y" if v else "n"
 
@@ -265,6 +294,7 @@ def cmd_simulate(args):
         live_snapshot = tempfile.mkdtemp(prefix="live-", dir=root)
         restore_profile(live_snapshot, CLAUDE)
         live_list = set(MIRROR.app_pin_list(CLAUDE) or pin_lists(live_prefs)[0])
+        live_view = account_view_fields(CLAUDE)
 
         print("\nStep 1  Swivel: save %s, restore %s's claude_desktop_config.json + config.json" % (src_profile, target))
         swivel_switch(root, sandbox, src_profile, CLAUDE, target, profile_dir(target))
@@ -272,19 +302,22 @@ def cmd_simulate(args):
         print("Step 2  cc-mirror-sessions exit %d: %s" % (code, summary))
         ok = check(sandbox, template, "after switch to %s" % target, sandbox_sessions)
         ok = compare_lists(live_list, sandbox, src_profile, sandbox_sessions) and ok
+        ok = check_view(sandbox, live_view, src_profile) and ok
 
         if args.round_trip:
             target_saved = tempfile.mkdtemp(prefix="target-", dir=root)
             restore_profile(target_saved, sandbox)
             target_list = set(MIRROR.app_pin_list(target_saved) or pin_lists(prefs_of(target_saved))[0])
+            target_view = account_view_fields(target_saved)
             print("\nStep 3  Swivel: save %s, restore %s again" % (target, src_profile))
             swivel_switch(root, sandbox, target, target_saved, src_profile, live_snapshot)
             code, summary = run_mirror(args.script, root)
             print("Step 4  cc-mirror-sessions exit %d: %s" % (code, summary))
             ok = check(sandbox, template, "back in %s" % src_profile, sandbox_sessions) and ok
             ok = compare_lists(target_list, sandbox, target, sandbox_sessions) and ok
+            ok = check_view(sandbox, target_view, target) and ok
 
-        print("\nRESULT: %s" % ("PASS: template pins present and pin lists match after every switch" if ok
+        print("\nRESULT: %s" % ("PASS: pins and sidebar view follow the outgoing account after every switch" if ok
                                  else "FAIL: see FAIL / MISSING / EXTRA lines above"))
         print("Scope: this covers Swivel's restore + cc-mirror-sessions only. What the Claude app does with the")
         print("list after it launches is not simulated; confirm that with --save-template / --check-live.")
