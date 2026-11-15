@@ -162,7 +162,7 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
 - Other localStorage keys: `epitaxy-folder-permission-mode.<accountUuid>` (per-account folder
   permission mode), `starred-session-groups`, `dframe-group-scopes` (sidebar groups; empty today),
   `dframe-store.state.customGroupsByScope` (custom groups and their session assignments).
-  Not synced; the sidebar view is, see "Sidebar view" below. Other `pin-state` IndexedDB keys (`dframe-session-groups`,
+  Not synced, and neither is the sidebar view (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
   `dframe-pinned-project-outputs`, `dframe-starred-cowork-remote`, …) are not synced either.
 - `local-agent-mode-sessions/<account>/<org>/` is Cowork, not Claude Code; out of scope.
 
@@ -192,35 +192,39 @@ account only if the outgoing one deleted it since the last sync.
 - Verified with a real round-trip switch on 2026-11-02: each direction carried its new tasks and the
   Scheduled list matched in both accounts.
 
-### Sidebar view (added 2026-11-15)
+### Sidebar view: server-side, cannot be synced from here (established 2026-11-15)
 
-The sidebar's view settings (Sessions grouped by folder / date / state, sort order, and the
-shown and collapsed state of each section) are per account, keyed by scope `<account>/<org>`, and
-held in three places inside the Claude folder Swivel swaps:
+The sidebar's view settings (Sessions grouped by folder / date / state, sort order, shown and
+collapsed state of each section) are per account, keyed by scope `<account>/<org>`. Three local
+copies exist inside the Claude folder Swivel swaps:
 
 | # | Store | Location |
 |---|---|---|
-| 1 | localStorage | `dframe-store` → `state.codeSidebarByScope[scope]` (`state.lastSidebarScopeKey` names the live scope) |
+| 1 | localStorage | `dframe-store` → `state.codeSidebarByScope[scope]` |
 | 2 | localStorage | `LSS-persisted.dframe-code-sections` → `value[scope]` |
 | 3 | config | `claude_desktop_config.json` → `preferences.epitaxyPrefs["dframe-code-sections"][scope]` |
 
-Each value is `{"sections": [...], "migratedFrom": 1, "prefsSeeded": true}`. Built-in sections have
-ids/kinds `pinned`, `routines`, `sessions`; a missing `groupBy` means none. Custom groups add
-`kind: "manual"` sections whose id is the group id. Not in IndexedDB as of 2026-11-15. The legacy
-`dframe-store.state.groupByByMode` is left over from before `migratedFrom: 1` and is not used.
+Value shape: `{"sections": [...], "migratedFrom": 1, "prefsSeeded": true}`; built-in sections
+`pinned`, `routines`, `sessions`, a missing `groupBy` means none, custom groups add `kind: "manual"`
+sections. `dframe-store.state.groupByByMode` is a pre-migration leftover and is not used.
 
-On a Swivel switch (same `swivel_switch()` checks as the pin seeding), `sync_sidebar_view` reads the
-outgoing account's entry from the profile snapshot (store 1, then 2, then 3), and writes the
-incoming account's entry in all three stores: for each built-in section it copies `VIEW_FIELDS`
-(`groupBy`, `sortBy`, `ascending`, `show`, `collapsed`, `shown`), removing a field the source lacks.
-Manual sections are never copied or removed, because custom groups themselves are not synced and a
-copied section would point at a group that does not exist there. With no entry for the incoming
-scope it creates one from the source's built-in sections; the scope comes from
-`lastSidebarScopeKey`, else the only org folder under `claude-code-sessions/<account>/`. The
-outgoing account's view wins every switch. Summary item: `view-synced N`. Opt out: `--no-view-sync`.
+**None of the three is the source.** About 3 s after launch the app replaces all three with the
+account's own value, which it does not read from any local file. Evidence (pin-watch log,
+2026-11-15 19:25): the RAS snapshot was staged with config = none, store 2 = date, store 1 = state;
+after the switch the app showed folder and rewrote config at +2.7 s and both localStorage keys at
++5.3 s to folder, a value no local copy held. Searched and ruled out: every LevelDB under the Claude
+folder (incl. IndexedDB and the decompressed react-query-cache blob), `Partitions`, `WebStorage`,
+the preferences plist, other JSON files in the Claude folder, and shared locations outside it
+(`~/.claude`, `~/.claude.json`, `~/Library/Preferences`). It differs per account and is not in the
+swapped folder, so it is held by Anthropic per account.
 
-`tools/simulate-switch` checks the view in all three stores after each switch. As with pins, it
-cannot show which store the app reads at launch; a real round-trip switch is the proof.
+Consequences:
+
+- Each account keeps its own view by itself, independent of Swivel; set it once in each account.
+- Copying it on a switch cannot work; a write to all three stores was tried (e2b7484, reverted) and
+  the app put the account's value back on launch. Do not retry it.
+- `tools/pin-watch` logs the three copies (`cfg.view`, `ls.sections.view`, `ls.store.view`) if this
+  needs re-checking after an app update.
 
 ### After editing the script
 
