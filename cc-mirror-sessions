@@ -68,7 +68,6 @@ Usage:
 """
 
 import argparse
-import copy
 import fcntl
 import glob
 import hashlib
@@ -857,164 +856,6 @@ def sync_scheduled_tasks(switch, dry_run):
         return 0, 1
 
 
-VIEW_PREF = "dframe-code-sections"
-LS_SECTIONS = LS_ORIGIN + b"LSS-persisted.dframe-code-sections"
-VIEW_KINDS = ("pinned", "routines", "sessions")
-VIEW_FIELDS = ("groupBy", "sortBy", "ascending", "show", "collapsed", "shown")
-
-
-def read_view_stores(cdir):
-    ldir = os.path.join(cdir, "Local Storage", "leveldb")
-    try:
-        best, max_seq = ls_read(ldir, (LS_STORE, LS_SECTIONS))
-        store, sect = ls_decode(best.get(LS_STORE)), ls_decode(best.get(LS_SECTIONS))
-    except Exception:
-        best, max_seq, store, sect = {}, 0, None, None
-    cfg_path = os.path.join(cdir, "claude_desktop_config.json")
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            raw = f.read()
-        cfg = json.loads(raw)
-        prefs = cfg["preferences"]["epitaxyPrefs"]
-        if not isinstance(prefs, dict):
-            raise ValueError("epitaxyPrefs")
-    except Exception:
-        raw = cfg = prefs = None
-    state = store.get("state") if isinstance(store, dict) else None
-    scopes = (state.get("codeSidebarByScope") if isinstance(state, dict) else None,
-              sect.get("value") if isinstance(sect, dict) else None,
-              prefs.get(VIEW_PREF) if isinstance(prefs, dict) else None)
-    return {"ldir": ldir, "best": best, "max_seq": max_seq, "store": store, "sect": sect,
-            "cfg_path": cfg_path, "raw": raw, "cfg": cfg, "prefs": prefs,
-            "scopes": [s if isinstance(s, dict) else {} for s in scopes],
-            "last": state.get("lastSidebarScopeKey") if isinstance(state, dict) else None}
-
-
-def account_view(stores, acct):
-    for scopes in stores["scopes"]:
-        keys = sorted(k for k, v in scopes.items() if k.split("/")[0] == acct
-                      and isinstance(v, dict) and isinstance(v.get("sections"), list))
-        if keys:
-            key = stores["last"] if stores["last"] in keys else keys[0]
-            return key, scopes[key]
-    return None
-
-
-def incoming_scope(stores, acct):
-    last = stores["last"]
-    if isinstance(last, str) and last.split("/")[0] == acct and "/" in last:
-        return last
-    try:
-        orgs = [o for o in os.listdir(os.path.join(BASE, acct))
-                if os.path.isdir(os.path.join(BASE, acct, o))]
-    except OSError:
-        return None
-    return "%s/%s" % (acct, orgs[0]) if len(orgs) == 1 else None
-
-
-def view_with(target, source):
-    src = {s.get("id"): s for s in source["sections"]
-           if isinstance(s, dict) and s.get("kind") in VIEW_KINDS}
-    if target is None:
-        entry = {k: copy.deepcopy(v) for k, v in source.items() if k != "sections"}
-        entry["sections"] = [copy.deepcopy(s) for s in src.values()]
-        return entry
-    entry = copy.deepcopy(target)
-    for s in entry["sections"]:
-        if not isinstance(s, dict) or s.get("kind") not in VIEW_KINDS or s.get("id") not in src:
-            continue
-        for k in VIEW_FIELDS:
-            if k in src[s["id"]]:
-                s[k] = copy.deepcopy(src[s["id"]][k])
-            else:
-                s.pop(k, None)
-    return entry
-
-
-def ls_write(ldir, max_seq, puts):
-    logs = sorted(glob.glob(os.path.join(ldir, "*.log")), key=file_number)
-    if not logs:
-        return False
-    fd = os.open(os.path.join(ldir, "LOCK"), os.O_RDWR | os.O_CREAT)
-    try:
-        try:
-            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return False
-        ls_append_batch(logs[-1], max_seq + 1, puts)
-        fcntl.lockf(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-    return True
-
-
-def write_config(cfg_path, cfg, raw):
-    body = json.dumps(cfg, indent=2, ensure_ascii=False)
-    if raw.endswith("\n"):
-        body += "\n"
-    try:
-        tmp = cfg_path + ".tmp-ccmirror"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(body)
-        shutil.copymode(cfg_path, tmp)
-        os.replace(tmp, cfg_path)
-    except OSError:
-        return False
-    return True
-
-
-def sync_sidebar_view(switch, dry_run, claude_dir=None, now_ms=None):
-    """On a Swivel switch, give the incoming account the outgoing account's
-    sidebar view (group by, sort, shown and collapsed state of the built-in
-    sections) in all three stores that hold it. Custom sections are left as
-    they are. Returns 1 when anything changed."""
-    if not switch or not switch[2]:
-        return 0
-    snap, out_acct, in_acct = switch
-    source = account_view(read_view_stores(snap), out_acct)
-    if source is None:
-        return 0
-    live = read_view_stores(claude_dir or CLAUDE_DIR)
-    if claude_running(live["ldir"]):
-        return 0
-    target = account_view(live, in_acct)
-    scope = target[0] if target else incoming_scope(live, in_acct)
-    if not scope:
-        return 0
-    entry = view_with(target[1] if target else None, source[1])
-    stamp = now_ms or int(time.time() * 1000)
-    changed = 0
-    puts = []
-    if glob.glob(os.path.join(live["ldir"], "*.log")):
-        store = live["store"]
-        state = store.get("state") if isinstance(store, dict) else None
-        if isinstance(state, dict) and isinstance(state.get("codeSidebarByScope", {}), dict):
-            by = state.setdefault("codeSidebarByScope", {})
-            if by.get(scope) != entry:
-                by[scope] = entry
-                puts.append((LS_STORE, ls_encode(store)))
-        sect = live["sect"]
-        if live["best"].get(LS_SECTIONS) is None or isinstance(sect, dict):
-            obj = dict(sect) if isinstance(sect, dict) else {"value": {}, "tabId": ""}
-            value = dict(obj["value"]) if isinstance(obj.get("value"), dict) else {}
-            if value.get(scope) != entry:
-                value[scope] = entry
-                obj["value"], obj["timestamp"] = value, stamp
-                puts.append((LS_SECTIONS, ls_encode(obj)))
-    if puts and (dry_run or ls_write(live["ldir"], live["max_seq"], puts)):
-        changed = 1
-    prefs = live["prefs"]
-    cur = prefs.get(VIEW_PREF, {}) if isinstance(prefs, dict) else None
-    if isinstance(cur, dict) and cur.get(scope) != entry:
-        if dry_run:
-            changed = 1
-        else:
-            prefs[VIEW_PREF] = dict(cur, **{scope: entry})
-            if write_config(live["cfg_path"], live["cfg"], live["raw"]):
-                changed = 1
-    return changed
-
-
 def seed_starred_from_list(folder_files, folders, acct, starred, dry_run):
     seeded = 0
     for a, _, path in folders:
@@ -1059,8 +900,6 @@ def main():
                     help="skip syncing isArchived/isStarred/title across accounts")
     ap.add_argument("--no-task-sync", action="store_true",
                     help="skip carrying scheduled tasks from the outgoing account on a Swivel switch")
-    ap.add_argument("--no-view-sync", action="store_true",
-                    help="skip carrying the sidebar view (group by, sort) from the outgoing account on a Swivel switch")
     ap.add_argument("--archive", default=None, metavar="GLOB",
                     help="recursive glob for archived transcripts (default: \"archive\" "
                          "in ~/.claude/cc-mirror.json; no archive -> no revive step)")
@@ -1355,10 +1194,6 @@ def main():
     if not args.no_flag_sync:
         pin_list = sync_starred_list(folders, args.dry_run)
 
-    view_synced = 0
-    if not args.no_view_sync:
-        view_synced = sync_sidebar_view(swivel_switch(), args.dry_run)
-
     # 2) Optional cleanup: remove DEAD (transcript-pruned) sessions spread to non-home
     #    accounts. Off by default — the Claude app prunes these itself on load.
     if args.prune:
@@ -1380,10 +1215,10 @@ def main():
     summary = (f"added {added}, repaired {fixed}, revived {revived}, pruned {pruned}, "
                f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}, "
                f"state-synced {state_synced}, pin-list {pin_list}, pin-seeded {seeded}, "
-               f"tasks-synced {tasks_synced}, tasks-sync-failed {tasks_failed}, view-synced {view_synced}")
+               f"tasks-synced {tasks_synced}, tasks-sync-failed {tasks_failed}")
     if args.quiet:
         if (added or fixed or pruned or revived or flag_synced or retitled or t_retitled or state_synced
-                or pin_list or seeded or tasks_synced or tasks_failed or view_synced):
+                or pin_list or seeded or tasks_synced or tasks_failed):
             print(f"cc-mirror-sessions: {summary}")
     else:
         print(f"\n{(verb + ' ') if verb else ''}{'add/repair/prune' if verb else 'Done'}: {summary}\n")
