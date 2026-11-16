@@ -292,8 +292,8 @@ the summary line, stop and report both sides.
 ## House rules that apply here
 
 - Agents commit and push their own changes here without asking (owner, 2026-11-02: "same as
-  agent-configs, managed by agents from now on"). Rules: agent-configs
-  `shared/common/rules/agent-configs-auto-commit.mdc`. Write every git call as
+  agent-configs, managed by agents from now on"). Rules: confstack-data
+  `/Volumes/T9/Documents/www/confstack-data/shared/common/rules/confstack-data-auto-commit.mdc`. Write every git call as
   `git -C /Volumes/T9/Documents/www/cc-mirror-sessions <subcommand>`, one per Bash call; push to
   `origin main` only; never force-push. Merging upstream and running `--prune` still need the
   owner's approval (see above). A pushed script is not live until it is copied to `~/bin`.
