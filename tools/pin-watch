@@ -204,6 +204,7 @@ def read_local_storage(ldir=LS_DIR):
         if name == "ls.slice" and isinstance(val, dict):
             val = val.get("pinnedOrder")
         if name == "ls.store":
+            out["ls.groups"] = {"seq": seq, "value": (obj.get("state") or {}).get("customGroupsByScope")}
             val = (obj.get("state") or {}).get("codeSidebarByScope")
         out[name] = {"seq": seq, "ts": obj.get("timestamp"), "value": val}
     return out
@@ -219,6 +220,20 @@ def view_of(scopes, acct):
         secs = entry.get("sections") if isinstance(entry, dict) else None
         out[scope[:8]] = {s.get("id"): s.get("groupBy", "none") for s in secs or []
                           if isinstance(s, dict) and s.get("kind") in ("pinned", "routines", "sessions")}
+        out[scope[:8]].update({"manual:%s" % s.get("name"): len(s.get("members") or []) for s in secs or []
+                               if isinstance(s, dict) and s.get("kind") == "manual"})
+    return out
+
+
+def groups_of(scopes, acct):
+    if not isinstance(scopes, dict):
+        return None
+    out = {}
+    for scope, entry in scopes.items():
+        if acct and not scope.startswith(acct) or not isinstance(entry, dict):
+            continue
+        names = [g.get("name") for g in entry.get("groups") or [] if isinstance(g, dict)]
+        out[scope[:8]] = {"groups": names, "assigned": len(entry.get("assignments") or {})}
     return out
 
 
@@ -286,6 +301,8 @@ def snapshot():
                                  value=view_of((ls["ls.sections"] or {}).get("value"), acct)),
         "ls.store.view": dict(seq=(ls["ls.store"] or {}).get("seq"),
                               value=view_of((ls["ls.store"] or {}).get("value"), acct)),
+        "ls.store.groups": dict(seq=(ls.get("ls.groups") or {}).get("seq"),
+                                value=groups_of((ls.get("ls.groups") or {}).get("value"), acct)),
     }
 
 
