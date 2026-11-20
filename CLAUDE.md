@@ -326,7 +326,12 @@ Section order, tested 2026-11-20 15:40 on the final script: 8 new test cases (6 
 the 2 that pass expect nothing to be written: an unknown placement, an entry the app has not seeded); `tools/simulate-switch
 --round-trip` from Personal to RAS and back, and to RASA. RAS (Routines collapsed above P0–P3) and RASA (Routines
 open above P0–P3) both became Pinned, P0–P3, Routines collapsed, Sessions, with the marker; only `order` and
-Routines' `collapsed` changed in RASA; the way back wrote nothing. Not yet seen in a real switch.
+Routines' `collapsed` changed in RASA; the way back wrote nothing.
+
+Real switch 2026-11-20 16:29, Personal → RASA, `sidebar-synced 1`: RASA went from Routines open above P0–P3 to
+Pinned, P0–P3, Routines collapsed, Sessions. Read with `read_sidebar_store` at 16:30 and 16:31 (pin-watch was not
+running): the marker was deleted and the order had not reverted. Whether the server row holds the new order is
+checked on the next switch into RASA that writes nothing (`sidebar-synced 0`), see confstack-data `docs/Todoist.md` T-011.
 
 Real switches on 2026-11-20, from `~/Library/Logs/cc-mirror-pin-watch.log` (times are when pin-watch saw it):
 
