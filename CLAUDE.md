@@ -82,7 +82,7 @@ which fields actually differ between copies of the same session, group every
 `local_*.json` by `cliSessionId` and compare values per key (read-only). Syncing everything by
 copying the whole newest file is wrong — it would overwrite the account-specific fields above.
 
-The `--quiet` summary gained trailing `state-synced N`, `pin-list N`, `pin-seeded N` and (2026-11-20) `groups-synced N` items. Swivel splits the line on commas and
+The `--quiet` summary gained trailing `state-synced N`, `pin-list N` and `pin-seeded N` items. Swivel splits the line on commas and
 shows every `name N` part with N > 0, so appending items is safe; renaming or reordering existing
 ones is not.
 
@@ -161,8 +161,8 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
 
 - Other localStorage keys: `epitaxy-folder-permission-mode.<accountUuid>` (per-account folder
   permission mode), `starred-session-groups`, `dframe-group-scopes` (sidebar groups; empty today),
-  `dframe-store.state.customGroupsByScope` (custom groups and their session assignments; carried on a
-  switch since 2026-11-20, see "Custom sidebar groups" below). The sidebar view is not synced (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
+  `dframe-store.state.customGroupsByScope` (custom groups and their session assignments; the group list is
+  held per account on the server, see "Custom sidebar groups" below). The sidebar view is not synced (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
   `dframe-pinned-project-outputs`, `dframe-starred-cowork-remote`, …) are not synced either.
 - `local-agent-mode-sessions/<account>/<org>/` is Cowork, not Claude Code; out of scope.
 
@@ -220,7 +220,9 @@ swapped folder, so it is held by Anthropic per account.
 
 What this covers: only the built-in sections' view fields (`groupBy`, `sortBy`, `ascending`, `show`,
 `collapsed`, `shown`). e2b7484 deliberately left custom (`kind: "manual"`) sections alone, so this test
-says nothing about them; they are a separate experiment, see "Custom sidebar groups" below.
+says nothing about them; they were tested separately on 2026-11-20 and are server-side too, see "Custom sidebar groups" below.
+The app's code confirms the view part: `groupByByMode`, `sortByByMode` and `sidebarSections` are wire keys of the
+server-synced sidebar store (same evidence as below).
 
 Consequences:
 
@@ -230,33 +232,42 @@ Consequences:
 - `tools/pin-watch` logs the three copies (`cfg.view`, `ls.sections.view`, `ls.store.view`) if this
   needs re-checking after an app update.
 
-### Custom sidebar groups (added 2026-11-20, waiting for a real switch to verify)
+### Custom sidebar groups: group list is server-side, cannot be added from here (established 2026-11-20)
 
-Custom groups (the owner's P0–P3) live in the same three stores as the view, per scope `<account>/<org>`:
+Custom groups (the owner's P0–P3) have local copies per scope `<account>/<org>`:
 
-| # | Store | What it holds |
-|---|---|---|
-| 1 | localStorage `dframe-store` → `state.customGroupsByScope[scope]` | `groups` (`id` `cg-…`, `name`, `mode`), `assignments` (`code:local_<id>` → group id), `order` |
-| 1 | localStorage `dframe-store` → `state.codeSidebarByScope[scope].sections` | one `kind: "manual"` section per group, with `members` |
-| 2 | localStorage `LSS-persisted.dframe-code-sections` → `value[scope]` | same sections, `members` written as `[]` by the app |
-| 3 | config `preferences.epitaxyPrefs["dframe-code-sections"][scope]` | mirror of #2 |
+| Store | What it holds |
+|---|---|
+| localStorage `dframe-store` → `state.customGroupsByScope[scope]` | `groups` (`id` `cg-…`, `name`, `mode`), `assignments` (`code:local_<id>` → group id), `order` |
+| localStorage `dframe-store` → `state.codeSidebarByScope[scope].sections` | one `kind: "manual"` section per group, with `members` |
+| localStorage `LSS-persisted.dframe-code-sections` and config `epitaxyPrefs["dframe-code-sections"]` | same sections, `members` written as `[]` |
+| localStorage `LSS-persisted.dframe-group-scopes` and config `epitaxyPrefs["dframe-group-scopes"]` | local-only part: assignments of this device's sessions, read at launch |
 
-Session ids in `assignments` are the same in every account (the index copies keep the filename), so
-they can be copied as they are. `IndexedDB` `pin-state` → `dframe-session-groups` is unrelated (empty).
+**None of them decides which groups exist.** Real switch Personal → RASA on 2026-11-20 with `pin-watch`
+running: the script (8070a55) wrote P0–P3 into dframe-store, `LSS-persisted.dframe-code-sections` and the
+config at 11:07:36; the app launched at 11:07:36.9, rewrote the config without them at +2.7 s and both
+localStorage keys at +6.5 s (`groups: []`). The code (Claude 6.28899.2, `ion-dist.asar` →
+`/assets/v1/index-DxfrQydf.js`) says why:
 
-`sync_custom_groups` (after the pin list, only on a Swivel switch, Claude quit) copies the outgoing
-account's groups into the incoming account: `customGroupsByScope[scope]` is replaced, the manual sections
-are taken from the matching outgoing store in the outgoing order, and the incoming account keeps its own
-built-in sections (their view is held on the server anyway). An outgoing account with **no** groups
-changes nothing, so an account whose groups the app wiped does not wipe the others; the cost is that
-deleting every group is not carried. Summary item `groups-synced N`; opt out with `--no-group-sync`.
+- The sidebar store `ob` (persisted as `dframe-store`) is registered for server sync:
+  `KM(ob, eAt, {extraWireKeys: ["customGroups","customGroupAssignments","customGroupOrder", …, "sidebarSections"],
+  serverPartialize: iAt, serverMerge: uX, …})`; `eAt` adds `pinnedOrder`, `groupByByMode`, `sortByByMode`,
+  `recentsTypeFilter`, `recentsStatusFilter`, `coworkActivityDays`, `routinesSidebarPlacement`, `navPinnedIds`, ….
+- `uX` (server row → local state): when the row has a `customGroups` array, the group list becomes the
+  server's; local `code:local_*` assignments are kept only for group ids in that list.
+- `iAt` (local → server) sends groups and only non-local members; assignments of local sessions never
+  leave the device. They are kept in `dframe-group-scopes` and merged in at launch with `groups: []`.
 
-Status: tests, a sandbox run on copies of all three profiles and `simulate-switch --round-trip` pass.
-Whether the app keeps the groups after launch is **not known yet**. Check it with a real switch from an
-account that has groups into one that has none while `pin-watch` runs: `ls.store.groups` and the
-`manual:<name>` entries in `cfg.view` / `ls.*.view` must still be there after the app has been open
-for a minute. If the app replaces them, revert the commit and record it like the view test above.
-Backup taken before installing: `~/.claude/backups/group-stores-20261120-105559/`.
+Consequences:
+
+- The group list must be created in each account (sidebar UI). Ids differ per account (`cg-<random>`).
+- 8070a55 copied the outgoing account's whole `customGroupsByScope` entry; reverted in e39f784, because
+  once the incoming account has its own groups it would also have wiped that account's local assignments.
+- Possible next step, not built: after the groups exist in every account with the same names, carry the
+  local assignments by group **name** (map the outgoing group id to the incoming account's id for the same
+  name) into `dframe-group-scopes` and `customGroupsByScope[scope].assignments`. By the code above these are
+  local-only and survive the server merge when the group id is in the server's list; not verified.
+- `tools/pin-watch` still logs `ls.store.groups` and `manual:<name>` member counts for re-checking.
 
 ### After editing the script
 
