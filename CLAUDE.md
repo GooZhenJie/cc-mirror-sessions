@@ -233,9 +233,15 @@ Consequences:
   needs re-checking after an app update.
 - The pending-upload marker described in "Sidebar carry on a switch" makes the local copy win at launch, so
   the view could now be carried the same way. It is not: it was not part of the owner's 2026-11-20
-  decisions (on that day all three accounts grouped Sessions by folder).
+  decisions (on that day all three accounts grouped Sessions by folder). Section order and each section's
+  `collapsed` are carried since the afternoon of 2026-11-20; `groupBy`, `sortBy`, `ascending`, `show` and
+  `shown` are still not.
+- Correction (code read 2026-11-20): `collapsed` is not held by the server. Before upload `iAt` passes the
+  sections through `xp` (export `aS`), which resets `collapsed` to the default (routines collapsed, the rest
+  open); when a server row is applied, `Sp` (export `oS`) takes `collapsed` from the local sections by id.
+  The 2026-11-15 evidence above only exercised `groupBy`.
 
-### Sidebar carry on a switch: groups, nav entries, display settings (2026-11-20)
+### Sidebar carry on a switch: groups, nav entries, section order, display settings (2026-11-20)
 
 `sync_sidebar()` runs on a Swivel switch (same `swivel_switch()` checks as pin seeding) and gives the
 incoming account the outgoing account's:
@@ -244,6 +250,9 @@ incoming account the outgoing account's:
 |---|---|---|
 | Custom groups (P0–P3) and their `code:local_*` assignments | `dframe-store` → `state.customGroupsByScope[<account>/<org>]`; local slice `dframe-group-scopes` (localStorage and config) | yes, wire keys `customGroups*` |
 | Nav entries at the top left | `dframe-store` → `state.navPinnedIds`, `navPinV` | yes, in `eAt` |
+| Order of the sidebar sections (Pinned, custom groups, Routines, Sessions) | `dframe-store` → `state.codeSidebarByScope[<account>/<org>].sections` (array order and each `order`) | yes, wire key `sidebarSections` |
+| Where routines sit (`inline` or `section`) | `dframe-store` → `state.routinesSidebarPlacement` | yes, in `eAt` |
+| Each section open or collapsed | same `sections`, each `collapsed` | no, see the correction under "Sidebar view" |
 | Sidebar width, collapsed folder groups | `dframe-store` → `state.sidebarWidth`, `state.collapsedGroups` | no |
 | Editor for "open in editor" | pref `claude-code-preferred-editor` | no |
 | Session activity filter | pref `code-sessions-state-activity-days.<account>` | no |
@@ -262,7 +271,8 @@ is registered with `KM(ob, eAt, {extraWireKeys, serverPartialize: iAt, serverMer
 and launch reconcile (`CC`) applies the account's server row over local state, unless
 `ccd-sync-pending:ccd/dframe-store` matches the vouched identity `<account>/<org>` (`Dx`). With that marker and
 no `|migrate` suffix it keeps local state, takes the server row as the base and uploads the full local row (`Hx`).
-It is the marker `jx(…, "edit")` writes after a local edit. So when groups or nav change, `sync_sidebar()`:
+It is the marker `jx(…, "edit")` writes after a local edit. So when groups, nav, section order or the routines
+placement change, `sync_sidebar()`:
 
 1. writes the marker `<account>/<ccd-sync-org>`, only when `ccd-sync-org` is known, `ccd-sync-owner` is missing
    or the incoming account, and `ccd-sync-quarantine` is not `1` (otherwise only the local-only items are carried);
@@ -271,9 +281,22 @@ It is the marker `jx(…, "edit")` writes after a local edit. So when groups or 
    into `|migrate`, and the server row would win for everything except groups. 5f3cf26 carried groups only
    through that legacy migration; this replaced it.
 
-Manual sections are not written: the store's persist `merge` runs `Tg` for every scope on load, which adds a
-`kind: "manual"` section for each group without one (before `sessions`, default settings) and drops sections
-of removed groups.
+Sections (added the afternoon of 2026-11-20, after the owner agreed to carry where Routines sits and whether it
+is open): the incoming account's own scope gets the outgoing account's section order. On load the store's
+persist `merge` runs `Tg` → `yp` for every scope: it keeps the given order, drops `kind: "manual"` sections whose
+group is gone, inserts a section for each group without one before `sessions` (default settings) and renumbers
+`order` (`hp`); `pp` on load sorts by `order`. So the script writes the whole order itself: a manual section for
+a carried group the incoming account lacks is created the way `yp` does (`SECTION_DEFAULTS` is `Yf`), sections only
+the incoming account has stay after their previous neighbour (as `gp` does), sections of groups it does not have
+are dropped, `sessions` stays last and `order` is renumbered as `hp` does. Only the order and `collapsed` are
+taken from the outgoing account; every other field of an existing section stays. Order needs the marker;
+`collapsed` alone is written without it, like the width.
+
+Neither is written unless the incoming entry has `prefsSeeded: true` (all three accounts did on 2026-11-20):
+without it hydration (`Ufn` via `Hfn`) and `eX` rebuild the entry from the `LSS-persisted.dframe-code-sections`
+copy and the legacy per-account prefs. That localStorage copy and the config copy
+(`epitaxyPrefs["dframe-code-sections"]`) are not written: `QY()` reads them only in those two places, both skip
+seeded entries, and the app rewrites both from the store (`tf("dframe-code-sections", Nfn(...))`).
 
 Cost, accepted by the owner on 2026-11-20 (decision page 1-B): the incoming account's whole sidebar row on the
 server (pins order, view settings, filters, groups, nav) is replaced by this Mac's copy, so changes made to
@@ -290,6 +313,7 @@ Rules:
   overwrites a customised list. `navSeedHere` is set to null, as `uX` does when it takes a server list.
 - Display settings and prefs: the outgoing value wins, including "not set" (coming from an account without an
   activity filter removes the incoming account's filter). Owner's choice, 2026-11-20 (decision page 2-A).
+- Routines placement: copied only when the outgoing value is `inline` or `section` (`Zh`).
 - Nothing is written when the incoming account already matches. Summary item `sidebar-synced N`; opt out with
   `--no-sidebar-sync`.
 
@@ -297,6 +321,12 @@ Tested: unit tests (Python 3.9); copies of all three profiles, Personal → RAS 
 with 5 assignments, 16 nav entries, width 363, 8 collapsed groups and editor vscode carried; RAS's permission
 mode and RASA's 3-day filter removed; the last two switches wrote nothing); `tools/simulate-switch --to RAS
 --round-trip` (pins PASS, `sidebar-synced 1` into RAS, 0 back).
+
+Section order, tested 2026-11-20 15:40 on the final script: 8 new test cases (6 fail on the previous version;
+the 2 that pass expect nothing to be written: an unknown placement, an entry the app has not seeded); `tools/simulate-switch
+--round-trip` from Personal to RAS and back, and to RASA. RAS (Routines collapsed above P0–P3) and RASA (Routines
+open above P0–P3) both became Pinned, P0–P3, Routines collapsed, Sessions, with the marker; only `order` and
+Routines' `collapsed` changed in RASA; the way back wrote nothing. Not yet seen in a real switch.
 
 Real switches on 2026-11-20, from `~/Library/Logs/cc-mirror-pin-watch.log` (times are when pin-watch saw it):
 

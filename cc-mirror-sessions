@@ -302,6 +302,10 @@ NAV_KEYS = ("navPinnedIds", "navPinV")
 VIEW_KEYS = ("sidebarWidth", "collapsedGroups")
 GLOBAL_PREFS = ("claude-code-preferred-editor",)
 ACCOUNT_PREFS = ("code-sessions-state-activity-days", "cc-landing-draft-permission-mode")
+ROUTINES_PLACEMENTS = ("inline", "section")
+SECTION_DEFAULTS = {"sortBy": "recency", "ascending": False,
+                    "show": {"metadata": False, "emptyGroups": False, "sideChats": False, "slack": True},
+                    "collapsed": False, "shown": True}
 LOG_BLOCK = 32768
 LOG_HEADER = 7
 
@@ -1051,7 +1055,115 @@ def valid_org(org):
     return isinstance(org, str) and bool(org) and org != "mixed" and "/" not in org
 
 
-def carry_synced(src, live, out_acct, in_acct, dropped):
+def section_list(entry):
+    sections = entry.get("sections") if isinstance(entry, dict) else None
+    if not isinstance(sections, list):
+        return None
+    return [s for s in sections if isinstance(s, dict) and isinstance(s.get("id"), str)
+            and isinstance(s.get("kind"), str)]
+
+
+def section_scope(state, acct, preferred):
+    by_scope = state.get("codeSidebarByScope")
+    if not isinstance(by_scope, dict):
+        return None
+    keys = sorted(k for k, v in by_scope.items()
+                  if k.count("/") == 1 and k.split("/")[0] == acct and section_list(v) is not None)
+    for key in list(preferred) + [state.get("lastSidebarScopeKey")]:
+        if key in keys:
+            return key
+    return keys[0] if keys else None
+
+
+def own_scope(acct, org):
+    return ["%s/%s" % (acct, org)] if valid_org(org) else []
+
+
+def outgoing_sections(src, out_acct):
+    s_state = src["state"]
+    key = section_scope(s_state, out_acct, [outgoing_scope(s_state, out_acct)] + own_scope(out_acct, src["org"]))
+    return section_list(s_state["codeSidebarByScope"][key]) if key else None
+
+
+def renumber_sections(sections):
+    pinned = next((i for i, s in enumerate(sections) if s["kind"] == "pinned" and "afterProjects" in s), -1)
+    out = []
+    for i, s in enumerate(sections):
+        n = 0 if i == pinned else i + 1 if i < pinned else i
+        out.append(s if s.get("order") == n else dict(s, order=n))
+    return out
+
+
+def group_members(gid, scope):
+    _, assign, order = group_parts(scope)
+    members = []
+    for key in order.get(gid, []) + list(assign):
+        if assign.get(key) == gid and key not in members:
+            members.append(key)
+    return members
+
+
+def new_manual_section(group, scope):
+    return {"id": group["id"], "kind": "manual", "v": 2, "name": group["name"], "order": 0,
+            "members": group_members(group["id"], scope), **copy.deepcopy(SECTION_DEFAULTS)}
+
+
+def carry_section_order(sections, state, scope):
+    by_scope = state.get("codeSidebarByScope")
+    entry = by_scope.get(scope) if isinstance(by_scope, dict) else None
+    current = section_list(entry)
+    if not sections or current is None or entry.get("prefsSeeded") is not True:
+        return False
+    by_groups = state.get("customGroupsByScope")
+    groups_scope = by_groups.get(scope) if isinstance(by_groups, dict) else None
+    groups = {g["id"]: g for g in group_parts(groups_scope)[0]}
+    have = {s["id"]: s for s in current}
+    ordered, ids = [], []
+    for s in sections:
+        if s["id"] in ids or (s["kind"] == "manual" and s["id"] not in groups):
+            continue
+        if s["id"] in have:
+            ordered.append(have[s["id"]])
+        elif s["kind"] == "manual":
+            ordered.append(new_manual_section(groups[s["id"]], groups_scope))
+        else:
+            continue
+        ids.append(s["id"])
+    pos = 0
+    for s in current:
+        if s["id"] in ids:
+            pos = ids.index(s["id"]) + 1
+        elif s["kind"] != "manual" or s["id"] in groups:
+            ordered.insert(pos, s)
+            ids.insert(pos, s["id"])
+            pos += 1
+    ordered = [s for s in ordered if s["kind"] != "sessions"] + [s for s in ordered if s["kind"] == "sessions"]
+    if [s["id"] for s in ordered] == [s["id"] for s in current]:
+        return False
+    state["codeSidebarByScope"] = {**by_scope, scope: dict(entry, sections=renumber_sections(ordered))}
+    return True
+
+
+def carry_collapsed(sections, state, scope):
+    by_scope = state.get("codeSidebarByScope")
+    entry = by_scope.get(scope) if isinstance(by_scope, dict) and scope else None
+    current = entry.get("sections") if isinstance(entry, dict) else None
+    if not sections or not isinstance(current, list) or entry.get("prefsSeeded") is not True:
+        return False
+    want = {s["id"]: s["collapsed"] for s in sections if isinstance(s.get("collapsed"), bool)}
+    out, changed = [], False
+    for s in current:
+        sid = s.get("id") if isinstance(s, dict) else None
+        if isinstance(sid, str) and sid in want and s.get("collapsed") != want[sid]:
+            s = dict(s, collapsed=want[sid])
+            changed = True
+        out.append(s)
+    if changed:
+        state["codeSidebarByScope"] = {**by_scope, scope: dict(entry, sections=out)}
+    return changed
+
+
+def carry_synced(src, live, out_acct, in_acct, dropped, sections=None):
     if not valid_org(live["org"]) or live["owner"] not in (None, in_acct) or live["quarantine"] == "1":
         return None, None
     scope = "%s/%s" % (in_acct, live["org"])
@@ -1070,7 +1182,12 @@ def carry_synced(src, live, out_acct, in_acct, dropped):
     if nav_changed:
         state.update(copy.deepcopy(nav))
         state["navSeedHere"] = None
-    if mirrored is None and not nav_changed:
+    placement = s_state.get("routinesSidebarPlacement")
+    placement_changed = placement in ROUTINES_PLACEMENTS and state.get("routinesSidebarPlacement") != placement
+    if placement_changed:
+        state["routinesSidebarPlacement"] = placement
+    order_changed = carry_section_order(sections, state, scope)
+    if mirrored is None and not nav_changed and not placement_changed and not order_changed:
         return None, None
     state["pendingLegacyGroupMigration"] = None
     return scope, mirrored
@@ -1126,9 +1243,12 @@ def sync_sidebar(switch, dry_run, claude_dir=None, state_path=None, now_ms=None)
     view = {k: src["state"][k] for k in VIEW_KEYS if k in src["state"]}
     view_changed = any(state.get(k) != v for k, v in view.items())
     state.update(copy.deepcopy(view))
-    scope, mirrored = carry_synced(src, live, out_acct, in_acct, dropped)
+    sections = outgoing_sections(src, out_acct)
+    scope, mirrored = carry_synced(src, live, out_acct, in_acct, dropped, sections)
+    in_scope = scope or section_scope(state, in_acct, own_scope(in_acct, live["org"]))
+    collapsed_changed = carry_collapsed(sections, state, in_scope)
     puts, cfg_changed = [], False
-    if view_changed or scope:
+    if view_changed or scope or collapsed_changed:
         puts.append((LS_STORE, ls_encode(live["store"])))
     if scope:
         puts.append((LS_PENDING, b"\x01" + scope.encode("latin-1")))

@@ -837,6 +837,112 @@ def test_sidebar_sync_carries_display_preferences(m, tmp_path):
     assert run_sidebar(m, tmp_path, switch, live) == 0
 
 
+def sec(sid, collapsed=False, order=0, name=""):
+    kind = "manual" if sid.startswith("cg-") else sid
+    out = {"id": sid, "kind": kind, "v": 2, "name": name, "order": order, "sortBy": "recency", "ascending": False,
+           "show": {"metadata": False, "emptyGroups": False, "sideChats": False, "slack": True},
+           "collapsed": collapsed, "shown": True}
+    if kind == "manual":
+        out["members"] = []
+    return out
+
+
+def sidebar(acct, org, *specs, **extra):
+    secs = [sec(*(spec if isinstance(spec, tuple) else (spec,)), order=i) for i, spec in enumerate(specs)]
+    entry = {"sections": secs, "migratedFrom": 1, "prefsSeeded": True}
+    return dict({"codeSidebarByScope": {"%s/%s" % (acct, org): entry}}, **extra)
+
+
+def sections_of(m, cdir):
+    return read_groups(m, cdir)[0]["codeSidebarByScope"]["acctB/orgB"]
+
+
+SETTLED = {"groups": [P0, P1, P2], "assignments": CARRIED, "order": {"cg-0": ["code:local_s1"]}}
+
+
+def test_sidebar_sync_carries_section_order_and_collapse(m, tmp_path):
+    switch, live = group_switch(
+        m, tmp_path, SOURCE_GROUPS, SETTLED,
+        source_extra=sidebar("acctA", "orgA", "pinned", "cg-0", "cg-1", "cg-2", ("routines", True), "sessions"),
+        state_extra=sidebar("acctB", "orgB", "pinned", "routines", "cg-0", "cg-1", "cg-2", "sessions"))
+    assert run_sidebar(m, tmp_path, switch, live) == 1
+    entry = sections_of(m, live)
+    assert [(s["id"], s["order"], s["collapsed"]) for s in entry["sections"]] == [
+        ("pinned", 0, False), ("cg-0", 1, False), ("cg-1", 2, False), ("cg-2", 3, False),
+        ("routines", 4, True), ("sessions", 5, False)]
+    assert (entry["migratedFrom"], entry["prefsSeeded"]) == (1, True)
+    assert read_groups(m, live)[0]["customGroupsByScope"]["acctB/orgB"] == SETTLED
+    assert marker(m, live) == (1, "acctB/orgB")
+    assert run_sidebar(m, tmp_path, switch, live) == 0
+
+
+def test_sidebar_sync_collapse_alone_stays_local(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, None, None,
+                                source_extra=sidebar("acctA", "orgA", "pinned", ("routines", True), "sessions"),
+                                state_extra=sidebar("acctB", "orgB", "pinned", "routines", "sessions"))
+    assert run_sidebar(m, tmp_path, switch, live) == 1
+    assert [s["collapsed"] for s in sections_of(m, live)["sections"]] == [False, True, False]
+    assert marker(m, live) is None
+    assert run_sidebar(m, tmp_path, switch, live) == 0
+
+
+def test_sidebar_sync_carries_collapse_but_not_order_when_the_app_would_not_upload(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, None, None, owner="someone-else",
+                                source_extra=sidebar("acctA", "orgA", ("routines", True), "pinned", "sessions"),
+                                state_extra=sidebar("acctB", "orgB", "pinned", "routines", "sessions"))
+    assert run_sidebar(m, tmp_path, switch, live) == 1
+    assert [(s["id"], s["collapsed"]) for s in sections_of(m, live)["sections"]] == [
+        ("pinned", False), ("routines", True), ("sessions", False)]
+    assert marker(m, live) is None
+
+
+def test_sidebar_sync_adds_sections_for_carried_groups_where_the_outgoing_had_them(m, tmp_path):
+    switch, live = group_switch(
+        m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS,
+        source_extra=sidebar("acctA", "orgA", "pinned", "cg-0", "cg-1", "cg-2", ("routines", True), "sessions"),
+        state_extra=sidebar("acctB", "orgB", "pinned", "routines", "sessions"))
+    assert run_sidebar(m, tmp_path, switch, live) == 1
+    got = sections_of(m, live)["sections"]
+    assert [(s["id"], s["order"], s["collapsed"]) for s in got] == [
+        ("pinned", 0, False), ("cg-0", 1, False), ("cg-1", 2, False), ("cg-2", 3, False),
+        ("routines", 4, True), ("sessions", 5, False)]
+    new = dict(sec("cg-0", order=1, name="P0"), members=["code:local_s1"])
+    assert got[1] == new
+    assert [(s["name"], s["members"]) for s in got[2:4]] == [("P1", ["code:local_s2"]), ("P2", [])]
+    assert marker(m, live) == (1, "acctB/orgB")
+
+
+def test_sidebar_sync_keeps_incoming_only_sections_and_drops_orphans(m, tmp_path):
+    mine = grp("cg-b", "Mine")
+    switch, live = group_switch(
+        m, tmp_path, {"groups": [P0], "assignments": {}, "order": {}},
+        {"groups": [mine], "assignments": {}, "order": {}},
+        source_extra=sidebar("acctA", "orgA", "pinned", "cg-0", "routines", "sessions"),
+        state_extra=sidebar("acctB", "orgB", "pinned", "routines", "cg-b", "cg-x", "sessions"))
+    assert run_sidebar(m, tmp_path, switch, live) == 1
+    assert [s["id"] for s in sections_of(m, live)["sections"]] == ["pinned", "cg-0", "routines", "cg-b", "sessions"]
+
+
+def test_sidebar_sync_leaves_sections_the_app_has_not_seeded(m, tmp_path):
+    target = sidebar("acctB", "orgB", "pinned", "routines", "sessions")
+    del target["codeSidebarByScope"]["acctB/orgB"]["prefsSeeded"]
+    switch, live = group_switch(m, tmp_path, None, None, state_extra=target,
+                                source_extra=sidebar("acctA", "orgA", ("routines", True), "pinned", "sessions"))
+    size = log_size(live)
+    assert run_sidebar(m, tmp_path, switch, live) == 0
+    assert log_size(live) == size
+
+
+@pytest.mark.parametrize("value, written", [("section", 1), ("weird", 0)])
+def test_sidebar_sync_carries_routines_placement(m, tmp_path, value, written):
+    switch, live = group_switch(m, tmp_path, None, None, source_extra={"routinesSidebarPlacement": value},
+                                state_extra={"routinesSidebarPlacement": "inline"})
+    assert run_sidebar(m, tmp_path, switch, live) == written
+    want = value if written else "inline"
+    assert read_groups(m, live)[0]["routinesSidebarPlacement"] == want
+    assert marker(m, live) == ((1, "acctB/orgB") if written else None)
+
+
 def test_sidebar_sync_dry_run_changes_nothing(m, tmp_path):
     switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS, prefs_scopes={},
                                 source_prefs={"claude-code-preferred-editor": "vscode"})
