@@ -82,7 +82,7 @@ which fields actually differ between copies of the same session, group every
 `local_*.json` by `cliSessionId` and compare values per key (read-only). Syncing everything by
 copying the whole newest file is wrong — it would overwrite the account-specific fields above.
 
-The `--quiet` summary gained trailing `state-synced N`, `pin-list N` and `pin-seeded N` items. Swivel splits the line on commas and
+The `--quiet` summary gained trailing `state-synced N`, `pin-list N`, `pin-seeded N` and (2026-11-20) `groups-synced N` items. Swivel splits the line on commas and
 shows every `name N` part with N > 0, so appending items is safe; renaming or reordering existing
 ones is not.
 
@@ -161,8 +161,8 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
 
 - Other localStorage keys: `epitaxy-folder-permission-mode.<accountUuid>` (per-account folder
   permission mode), `starred-session-groups`, `dframe-group-scopes` (sidebar groups; empty today),
-  `dframe-store.state.customGroupsByScope` (custom groups and their session assignments).
-  Not synced, and neither is the sidebar view (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
+  `dframe-store.state.customGroupsByScope` (custom groups and their session assignments; carried on a
+  switch since 2026-11-20, see "Custom sidebar groups" below). The sidebar view is not synced (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
   `dframe-pinned-project-outputs`, `dframe-starred-cowork-remote`, …) are not synced either.
 - `local-agent-mode-sessions/<account>/<org>/` is Cowork, not Claude Code; out of scope.
 
@@ -218,6 +218,10 @@ the preferences plist, other JSON files in the Claude folder, and shared locatio
 (`~/.claude`, `~/.claude.json`, `~/Library/Preferences`). It differs per account and is not in the
 swapped folder, so it is held by Anthropic per account.
 
+What this covers: only the built-in sections' view fields (`groupBy`, `sortBy`, `ascending`, `show`,
+`collapsed`, `shown`). e2b7484 deliberately left custom (`kind: "manual"`) sections alone, so this test
+says nothing about them; they are a separate experiment, see "Custom sidebar groups" below.
+
 Consequences:
 
 - Each account keeps its own view by itself, independent of Swivel; set it once in each account.
@@ -225,6 +229,34 @@ Consequences:
   the app put the account's value back on launch. Do not retry it.
 - `tools/pin-watch` logs the three copies (`cfg.view`, `ls.sections.view`, `ls.store.view`) if this
   needs re-checking after an app update.
+
+### Custom sidebar groups (added 2026-11-20, waiting for a real switch to verify)
+
+Custom groups (the owner's P0–P3) live in the same three stores as the view, per scope `<account>/<org>`:
+
+| # | Store | What it holds |
+|---|---|---|
+| 1 | localStorage `dframe-store` → `state.customGroupsByScope[scope]` | `groups` (`id` `cg-…`, `name`, `mode`), `assignments` (`code:local_<id>` → group id), `order` |
+| 1 | localStorage `dframe-store` → `state.codeSidebarByScope[scope].sections` | one `kind: "manual"` section per group, with `members` |
+| 2 | localStorage `LSS-persisted.dframe-code-sections` → `value[scope]` | same sections, `members` written as `[]` by the app |
+| 3 | config `preferences.epitaxyPrefs["dframe-code-sections"][scope]` | mirror of #2 |
+
+Session ids in `assignments` are the same in every account (the index copies keep the filename), so
+they can be copied as they are. `IndexedDB` `pin-state` → `dframe-session-groups` is unrelated (empty).
+
+`sync_custom_groups` (after the pin list, only on a Swivel switch, Claude quit) copies the outgoing
+account's groups into the incoming account: `customGroupsByScope[scope]` is replaced, the manual sections
+are taken from the matching outgoing store in the outgoing order, and the incoming account keeps its own
+built-in sections (their view is held on the server anyway). An outgoing account with **no** groups
+changes nothing, so an account whose groups the app wiped does not wipe the others; the cost is that
+deleting every group is not carried. Summary item `groups-synced N`; opt out with `--no-group-sync`.
+
+Status: tests, a sandbox run on copies of all three profiles and `simulate-switch --round-trip` pass.
+Whether the app keeps the groups after launch is **not known yet**. Check it with a real switch from an
+account that has groups into one that has none while `pin-watch` runs: `ls.store.groups` and the
+`manual:<name>` entries in `cfg.view` / `ls.*.view` must still be there after the app has been open
+for a minute. If the app replaces them, revert the commit and record it like the view test above.
+Backup taken before installing: `~/.claude/backups/group-stores-20261120-105559/`.
 
 ### After editing the script
 
