@@ -68,6 +68,7 @@ Usage:
 """
 
 import argparse
+import copy
 import fcntl
 import glob
 import hashlib
@@ -286,6 +287,14 @@ LS_STARRED = LS_ORIGIN + b"LSS-persisted.starred-local-code-sessions"
 LS_SLICE = LS_ORIGIN + b"LSS-persisted.dframe-local-slice"
 LS_STORE = LS_ORIGIN + b"dframe-store"
 LS_PIN_KEYS = (LS_STARRED, LS_SLICE, LS_STORE)
+LS_GROUP_SCOPES = LS_ORIGIN + b"LSS-persisted.dframe-group-scopes"
+LS_SYNC_OWNER = LS_ORIGIN + b"ccd-sync-owner"
+LS_SYNC_ORG = LS_ORIGIN + b"ccd-sync-org"
+LS_SYNC_QUARANTINE = LS_ORIGIN + b"ccd-sync-quarantine"
+LS_GROUP_KEYS = (LS_STORE, LS_GROUP_SCOPES, LS_SYNC_OWNER, LS_SYNC_ORG, LS_SYNC_QUARANTINE)
+GROUP_SCOPES_PREF = "dframe-group-scopes"
+GROUP_STATE = os.path.join(HOME, ".claude", "cc-mirror-groups.json")
+LOCAL_SESSION = "code:local_"
 LOG_BLOCK = 32768
 LOG_HEADER = 7
 
@@ -516,12 +525,16 @@ def ls_read(ldir, keys):
     return best, max_seq
 
 
-def ls_decode(rec):
+def ls_text(rec):
     if rec is None or rec[1] != 1 or not rec[2]:
         return None
     raw = rec[2]
-    text = raw[1:].decode("latin-1") if raw[0] == 1 else raw[1:].decode("utf-16-le")
-    return json.loads(text)
+    return raw[1:].decode("latin-1") if raw[0] == 1 else raw[1:].decode("utf-16-le")
+
+
+def ls_decode(rec):
+    text = ls_text(rec)
+    return None if text is None else json.loads(text)
 
 
 def ls_encode(obj):
@@ -552,6 +565,38 @@ def ls_append_batch(log_path, seq, puts):
         f.write(out)
         f.flush()
         os.fsync(f.fileno())
+
+
+def ls_write(ldir, max_seq, puts):
+    logs = sorted(glob.glob(os.path.join(ldir, "*.log")), key=file_number)
+    if not logs:
+        return False
+    fd = os.open(os.path.join(ldir, "LOCK"), os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        ls_append_batch(logs[-1], max_seq + 1, puts)
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return True
+
+
+def write_config(cfg_path, cfg, raw):
+    body = json.dumps(cfg, indent=2, ensure_ascii=False)
+    if raw.endswith("\n"):
+        body += "\n"
+    try:
+        tmp = cfg_path + ".tmp-ccmirror"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+        shutil.copymode(cfg_path, tmp)
+        os.replace(tmp, cfg_path)
+    except OSError:
+        return False
+    return True
 
 
 IDB_REL = os.path.join("IndexedDB", "https_claude.ai_0.indexeddb.leveldb")
@@ -700,17 +745,7 @@ def sync_local_storage_pins(ldir, wanted, dry_run, now_ms=None):
         return 0
     if dry_run:
         return 1
-    fd = os.open(os.path.join(ldir, "LOCK"), os.O_RDWR | os.O_CREAT)
-    try:
-        try:
-            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return 0
-        ls_append_batch(logs[-1], max_seq + 1, puts)
-        fcntl.lockf(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-    return 1
+    return 1 if ls_write(ldir, max_seq, puts) else 0
 
 
 def claude_running(ldir=None):
@@ -784,16 +819,7 @@ def sync_starred_list(folders, dry_run, claude_dir=None, ldir=None):
         prefs[STARRED_PREF] = wanted
         if order is not None:
             slice_["pinnedOrder"] = order
-        body = json.dumps(cfg, indent=2, ensure_ascii=False)
-        if raw.endswith("\n"):
-            body += "\n"
-        try:
-            tmp = cfg_path + ".tmp-ccmirror"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(body)
-            shutil.copymode(cfg_path, tmp)
-            os.replace(tmp, cfg_path)
-        except OSError:
+        if not write_config(cfg_path, cfg, raw):
             return ls_changed
     return 1
 
@@ -856,6 +882,231 @@ def sync_scheduled_tasks(switch, dry_run):
         return 0, 1
 
 
+def group_parts(scope):
+    scope = scope if isinstance(scope, dict) else {}
+    groups = scope.get("groups") if isinstance(scope.get("groups"), list) else []
+    groups = [g for g in groups if isinstance(g, dict) and isinstance(g.get("id"), str)
+              and isinstance(g.get("name"), str)]
+    assign = scope.get("assignments") if isinstance(scope.get("assignments"), dict) else {}
+    assign = {k: v for k, v in assign.items() if isinstance(v, str)}
+    order = scope.get("order") if isinstance(scope.get("order"), dict) else {}
+    order = {k: [x for x in v if isinstance(x, str)] for k, v in order.items() if isinstance(v, list)}
+    return groups, assign, order
+
+
+def group_ids(scope):
+    return {g["id"] for g in group_parts(scope)[0]}
+
+
+def is_local_session(key):
+    return key.startswith(LOCAL_SESSION)
+
+
+def mirror_groups(source, target, dropped):
+    s_groups, s_assign, s_order = group_parts(source)
+    t_groups, t_assign, t_order = group_parts(target)
+    carried = [g for g in s_groups if g["id"] not in dropped]
+    ids = {g["id"] for g in carried}
+    by_id = {g["id"]: g for g in carried}
+    t_ids = {g["id"] for g in t_groups}
+    groups = [by_id.get(g["id"], g) for g in t_groups] + [g for g in carried if g["id"] not in t_ids]
+    moved = {k: v for k, v in s_assign.items() if is_local_session(k) and v in ids}
+    assign = {k: v for k, v in t_assign.items()
+              if not (is_local_session(k) and (v in ids or k in moved))}
+    assign.update(moved)
+    s_local = {g: [x for x in s_order.get(g, []) if is_local_session(x)] for g in ids}
+    order = {g: [x for x in v if x not in moved] for g, v in t_order.items() if g not in ids}
+    for g in sorted(ids):
+        members = s_local[g] + [x for x in t_order.get(g, []) if not is_local_session(x)]
+        if members or g in t_order:
+            order[g] = members
+    base = target if isinstance(target, dict) else {}
+    mirrored = dict(base, groups=groups, assignments=assign, order=order)
+    migration = {"groups": carried, "assignments": moved,
+                 "order": {g: v for g, v in s_local.items() if v}}
+    return copy.deepcopy(mirrored), copy.deepcopy(migration)
+
+
+def merge_migration(old, new, dropped):
+    o_groups, o_assign, o_order = group_parts(old)
+    n_groups, n_assign, n_order = group_parts(new)
+    n_ids = {g["id"] for g in n_groups}
+    groups = [g for g in n_groups + [g for g in o_groups if g["id"] not in n_ids]
+              if g["id"] not in dropped]
+    keep = {g["id"] for g in groups}
+    base = {k: v for k, v in old.items() if k not in ("groups", "assignments", "order")} \
+        if isinstance(old, dict) else {}
+    return copy.deepcopy(dict(base, groups=groups,
+                              assignments={k: v for k, v in {**o_assign, **n_assign}.items() if v in keep},
+                              order={g: v for g, v in {**o_order, **n_order}.items() if g in keep}))
+
+
+def local_slice(prev, scope):
+    groups, assign, order = group_parts(scope)
+    p_groups, p_assign, p_order = group_parts(prev)
+    kept_assign = {k: v for k, v in p_assign.items() if not is_local_session(k)}
+    kept_assign.update({k: v for k, v in assign.items() if is_local_session(k)})
+    kept_order = {}
+    for g in list(p_order) + [g for g in order if g not in p_order]:
+        members = ([x for x in p_order.get(g, []) if not is_local_session(x)]
+                   + [x for x in order.get(g, []) if is_local_session(x)])
+        if members:
+            kept_order[g] = members
+    used = set(kept_assign.values()) | set(kept_order)
+    ids = {g["id"] for g in groups}
+    kept = [g for g in groups if g["id"] in used] + \
+        [g for g in p_groups if g["id"] in used and g["id"] not in ids]
+    base = {k: v for k, v in prev.items() if k not in ("groups", "assignments", "order")} \
+        if isinstance(prev, dict) else {}
+    return copy.deepcopy(dict(base, groups=kept, assignments=kept_assign, order=kept_order))
+
+
+def slice_update(entries, scope, mirrored):
+    entry = local_slice(entries.get(scope), mirrored)
+    if entry == entries.get(scope):
+        return None
+    if scope not in entries and not (entry["groups"] or entry["assignments"] or entry["order"]):
+        return None
+    return {**entries, scope: entry}
+
+
+def read_group_store(cdir):
+    ldir = os.path.join(cdir, "Local Storage", "leveldb")
+    try:
+        best, max_seq = ls_read(ldir, LS_GROUP_KEYS)
+        store = ls_decode(best.get(LS_STORE))
+        scopes = ls_decode(best.get(LS_GROUP_SCOPES))
+        owner = ls_text(best.get(LS_SYNC_OWNER))
+        org = ls_text(best.get(LS_SYNC_ORG))
+        quarantine = ls_text(best.get(LS_SYNC_QUARANTINE))
+    except Exception:
+        return None
+    state = store.get("state") if isinstance(store, dict) else None
+    if not isinstance(state, dict):
+        return None
+    return {"ldir": ldir, "max_seq": max_seq, "store": store, "state": state, "scopes": scopes,
+            "owner": owner, "org": org, "quarantine": quarantine}
+
+
+def account_scopes(state, acct):
+    by_scope = state.get("customGroupsByScope")
+    if not isinstance(by_scope, dict):
+        return {}
+    return {k: v for k, v in by_scope.items() if k.count("/") == 1 and k.split("/")[0] == acct}
+
+
+def outgoing_scope(state, acct):
+    scopes = sorted(k for k, v in account_scopes(state, acct).items() if group_parts(v)[0])
+    if not scopes:
+        return None
+    last = state.get("lastSidebarScopeKey")
+    return last if last in scopes else scopes[0]
+
+
+def incoming_scope(store, acct):
+    org = store["org"]
+    if isinstance(org, str) and org and org != "mixed" and "/" not in org:
+        return "%s/%s" % (acct, org)
+    last = store["state"].get("lastSidebarScopeKey")
+    if isinstance(last, str) and last.count("/") == 1 and last.split("/")[0] == acct:
+        return last
+    keys = sorted(account_scopes(store["state"], acct))
+    return keys[0] if len(keys) == 1 else None
+
+
+def load_group_state(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else {}
+    dropped = data.get("dropped") if isinstance(data.get("dropped"), list) else []
+    return accounts, {x for x in dropped if isinstance(x, str)}
+
+
+def save_group_state(path, accounts, dropped):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"accounts": accounts, "dropped": sorted(dropped)}, f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def observe_groups(accounts, dropped, acct, state):
+    known = set()
+    for scope in account_scopes(state, acct).values():
+        known |= group_ids(scope)
+    pending = state.get("pendingLegacyGroupMigration")
+    prev = accounts.get(acct)
+    prev = prev.get("known") if isinstance(prev, dict) else None
+    if isinstance(prev, list) and not pending:
+        dropped |= {x for x in prev if isinstance(x, str)} - known
+    accounts[acct] = {"known": sorted(known | group_ids(pending))}
+
+
+def carry_groups(src, live, out_acct, in_acct, dropped, dry_run, cdir, now_ms):
+    key = outgoing_scope(src["state"], out_acct)
+    scope = incoming_scope(live, in_acct)
+    if not key or not scope or live["owner"] not in (None, in_acct) or live["quarantine"] == "1":
+        return None
+    state = live["state"]
+    by_scope = state.get("customGroupsByScope") if isinstance(state.get("customGroupsByScope"), dict) else {}
+    mirrored, migration = mirror_groups(src["state"]["customGroupsByScope"][key], by_scope.get(scope), dropped)
+    if mirrored == by_scope.get(scope):
+        return None
+    state["customGroupsByScope"] = {**by_scope, scope: mirrored}
+    pending = merge_migration(state.get("pendingLegacyGroupMigration"), migration, dropped)
+    state["pendingLegacyGroupMigration"] = pending
+    puts = [(LS_STORE, ls_encode(live["store"]))]
+    scopes = live["scopes"]
+    if isinstance(scopes, dict) and isinstance(scopes.get("value"), dict):
+        value = slice_update(scopes["value"], scope, mirrored)
+        if value is not None:
+            puts.append((LS_GROUP_SCOPES, ls_encode(dict(scopes, value=value,
+                                                         timestamp=now_ms or int(time.time() * 1000)))))
+    if not dry_run and not ls_write(live["ldir"], live["max_seq"], puts):
+        return None
+    cfg_path = os.path.join(cdir, "claude_desktop_config.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            raw = f.read()
+        cfg = json.loads(raw)
+        prefs = cfg["preferences"]["epitaxyPrefs"]
+        entries = prefs.get(GROUP_SCOPES_PREF, {})
+    except Exception:
+        entries = None
+    if isinstance(entries, dict) and not dry_run:
+        value = slice_update(entries, scope, mirrored)
+        if value is not None:
+            prefs[GROUP_SCOPES_PREF] = value
+            write_config(cfg_path, cfg, raw)
+    return group_ids(mirrored) | group_ids(pending)
+
+
+def sync_custom_groups(switch, dry_run, claude_dir=None, state_path=None, now_ms=None):
+    if not switch or not switch[2]:
+        return 0
+    snap, out_acct, in_acct = switch
+    cdir = claude_dir or CLAUDE_DIR
+    src, live = read_group_store(snap), read_group_store(cdir)
+    if src is None or live is None or claude_running(live["ldir"]):
+        return 0
+    path = state_path or GROUP_STATE
+    accounts, dropped = load_group_state(path)
+    observe_groups(accounts, dropped, out_acct, src["state"])
+    observe_groups(accounts, dropped, in_acct, live["state"])
+    carried = carry_groups(src, live, out_acct, in_acct, dropped, dry_run, cdir, now_ms)
+    if carried is not None:
+        accounts[in_acct] = {"known": sorted(set(accounts[in_acct]["known"]) | carried)}
+    if not dry_run:
+        save_group_state(path, accounts, dropped)
+    return 0 if carried is None else 1
+
+
 def seed_starred_from_list(folder_files, folders, acct, starred, dry_run):
     seeded = 0
     for a, _, path in folders:
@@ -900,6 +1151,8 @@ def main():
                     help="skip syncing isArchived/isStarred/title across accounts")
     ap.add_argument("--no-task-sync", action="store_true",
                     help="skip carrying scheduled tasks from the outgoing account on a Swivel switch")
+    ap.add_argument("--no-group-sync", action="store_true",
+                    help="skip carrying custom sidebar groups from the outgoing account on a Swivel switch")
     ap.add_argument("--archive", default=None, metavar="GLOB",
                     help="recursive glob for archived transcripts (default: \"archive\" "
                          "in ~/.claude/cc-mirror.json; no archive -> no revive step)")
@@ -1194,6 +1447,10 @@ def main():
     if not args.no_flag_sync:
         pin_list = sync_starred_list(folders, args.dry_run)
 
+    groups_synced = 0
+    if not args.no_group_sync:
+        groups_synced = sync_custom_groups(swivel_switch(), args.dry_run)
+
     # 2) Optional cleanup: remove DEAD (transcript-pruned) sessions spread to non-home
     #    accounts. Off by default — the Claude app prunes these itself on load.
     if args.prune:
@@ -1215,10 +1472,10 @@ def main():
     summary = (f"added {added}, repaired {fixed}, revived {revived}, pruned {pruned}, "
                f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}, "
                f"state-synced {state_synced}, pin-list {pin_list}, pin-seeded {seeded}, "
-               f"tasks-synced {tasks_synced}, tasks-sync-failed {tasks_failed}")
+               f"tasks-synced {tasks_synced}, tasks-sync-failed {tasks_failed}, groups-synced {groups_synced}")
     if args.quiet:
         if (added or fixed or pruned or revived or flag_synced or retitled or t_retitled or state_synced
-                or pin_list or seeded or tasks_synced or tasks_failed):
+                or pin_list or seeded or tasks_synced or tasks_failed or groups_synced):
             print(f"cc-mirror-sessions: {summary}")
     else:
         print(f"\n{(verb + ' ') if verb else ''}{'add/repair/prune' if verb else 'Done'}: {summary}\n")

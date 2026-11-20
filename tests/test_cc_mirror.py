@@ -108,6 +108,7 @@ def make_store(m, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "LS_DIR", str(tmp_path / "no-claude" / "ls"))
     monkeypatch.setattr(m, "SWIVEL_DIR", str(tmp_path / "no-swivel"))
     monkeypatch.setattr(m, "TASK_SYNC_SCRIPT", str(tmp_path / "no-task-sync"))
+    monkeypatch.setattr(m, "GROUP_STATE", str(tmp_path / "groups-state.json"))
     return base, proj
 
 
@@ -266,7 +267,8 @@ def test_quiet_summary_keeps_swivel_format(m, tmp_path, monkeypatch, capsys):
     run_main(m, monkeypatch)
     line = capsys.readouterr().out.strip()
     assert line.startswith("cc-mirror-sessions: added 0,")
-    assert line.endswith("state-synced 1, pin-list 0, pin-seeded 0, tasks-synced 0, tasks-sync-failed 0")
+    assert line.endswith("state-synced 1, pin-list 0, pin-seeded 0, tasks-synced 0, tasks-sync-failed 0, "
+                         "groups-synced 0")
 
 
 def make_claude_dir(tmp_path, acct, starred, order=None, running=False):
@@ -615,3 +617,202 @@ def test_task_sync_skipped_with_flag(m, tmp_path, monkeypatch):
     make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", ["local_s1"])
     run_main(m, monkeypatch, argv=("--quiet", "--no-task-sync"))
     assert not calls.exists()
+
+
+def grp(gid, name):
+    return {"id": gid, "name": name, "mode": "code"}
+
+
+P0, P1, P2 = grp("cg-0", "P0"), grp("cg-1", "P1"), grp("cg-2", "P2")
+SOURCE_GROUPS = {"groups": [P0, P1, P2],
+                 "assignments": {"code:local_s1": "cg-0", "code:local_s2": "cg-1", "cowork:x": "cg-1"},
+                 "order": {"cg-0": ["code:local_s1"], "cg-1": []}}
+EMPTY_GROUPS = {"groups": [], "assignments": {}, "order": {}}
+CARRIED = {"code:local_s1": "cg-0", "code:local_s2": "cg-1"}
+
+
+def write_group_store(m, cdir, acct, org, scope, owner=None, quarantine=None, pending=None,
+                      prefs_scopes=None, ls_scopes=None):
+    ldir = cdir / "Local Storage" / "leveldb"
+    ldir.mkdir(parents=True, exist_ok=True)
+    (ldir / "LOCK").write_text("")
+    log = ldir / "000003.log"
+    if not log.exists():
+        log.write_bytes(b"")
+    key = "%s/%s" % (acct, org)
+    state = {"pinnedOrder": [], "customGroupsByScope": {} if scope is None else {key: scope},
+             "pendingLegacyGroupMigration": pending, "lastSidebarScopeKey": key}
+    puts = [(m.LS_STORE, m.ls_encode({"state": state, "version": 1})),
+            (m.LS_SYNC_ORG, b"\x01" + org.encode())]
+    if owner:
+        puts.append((m.LS_SYNC_OWNER, b"\x01" + owner.encode()))
+    if quarantine:
+        puts.append((m.LS_SYNC_QUARANTINE, b"\x01" + quarantine.encode()))
+    if ls_scopes is not None:
+        puts.append((m.LS_GROUP_SCOPES, m.ls_encode({"value": ls_scopes, "tabId": "", "timestamp": 1})))
+    _, max_seq = m.ls_read(str(ldir), m.LS_GROUP_KEYS)
+    m.ls_append_batch(str(log), max_seq + 1, puts)
+    (cdir / "config.json").write_text(json.dumps({"lastKnownAccountUuid": acct}))
+    prefs = {"other": {"keep": "me"}}
+    if prefs_scopes is not None:
+        prefs["dframe-group-scopes"] = prefs_scopes
+    (cdir / "claude_desktop_config.json").write_text(
+        json.dumps({"preferences": {"epitaxyPrefs": prefs}}, indent=2) + "\n")
+    return cdir
+
+
+def read_groups(m, cdir):
+    best, _ = m.ls_read(str(cdir / "Local Storage" / "leveldb"), m.LS_GROUP_KEYS)
+    return m.ls_decode(best.get(m.LS_STORE))["state"], m.ls_decode(best.get(m.LS_GROUP_SCOPES))
+
+
+def group_switch(m, tmp_path, source, target, **kw):
+    snap = write_group_store(m, tmp_path / "snap", "acctA", "orgA", source, owner="acctA")
+    kw.setdefault("owner", "acctB")
+    live = write_group_store(m, tmp_path / "live", "acctB", "orgB", target, **kw)
+    return (str(snap), "acctA", "acctB"), live
+
+
+def run_groups(m, tmp_path, switch, live, dry_run=False):
+    return m.sync_custom_groups(switch, dry_run, claude_dir=str(live),
+                                state_path=str(tmp_path / "groups.json"), now_ms=7)
+
+
+def log_size(cdir):
+    return os.path.getsize(cdir / "Local Storage" / "leveldb" / "000003.log")
+
+
+def test_group_sync_gives_incoming_account_the_outgoing_groups(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS, prefs_scopes={}, ls_scopes={})
+    assert run_groups(m, tmp_path, switch, live) == 1
+    state, scopes = read_groups(m, live)
+    carried = {"groups": [P0, P1, P2], "assignments": CARRIED, "order": {"cg-0": ["code:local_s1"]}}
+    assert state["customGroupsByScope"]["acctB/orgB"] == carried
+    assert state["pendingLegacyGroupMigration"] == carried
+    assert state["pinnedOrder"] == []
+    local = {"groups": [P0, P1], "assignments": CARRIED, "order": {"cg-0": ["code:local_s1"]}}
+    assert scopes == {"value": {"acctB/orgB": local}, "tabId": "", "timestamp": 7}
+    assert prefs_of(live)["epitaxyPrefs"] == {"other": {"keep": "me"}, "dframe-group-scopes": {"acctB/orgB": local}}
+    assert run_groups(m, tmp_path, switch, live) == 0
+
+
+def test_group_sync_follows_renames_moves_and_removals(m, tmp_path):
+    mine = grp("cg-b", "Mine")
+    target = {"groups": [grp("cg-0", "old name"), mine],
+              "assignments": {"code:local_s1": "cg-1", "code:local_s3": "cg-0", "code:local_s4": "cg-b",
+                              "code:local_s2": "cg-b", "chat:z": "cg-0"},
+              "order": {"cg-0": ["chat:z", "code:local_s3"], "cg-b": ["code:local_s4", "code:local_s2"]},
+              "pinnedName": "Pins"}
+    stale = {"acctB/orgB": {"groups": [grp("cg-0", "old name")],
+                            "assignments": {"code:local_s3": "cg-0", "cowork:local_q": "cg-0"}, "order": {}}}
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, target, prefs_scopes=stale, ls_scopes=stale)
+    assert run_groups(m, tmp_path, switch, live) == 1
+    state, scopes = read_groups(m, live)
+    assert state["customGroupsByScope"]["acctB/orgB"] == {
+        "groups": [P0, mine, P1, P2],
+        "assignments": {"code:local_s1": "cg-0", "code:local_s2": "cg-1", "code:local_s4": "cg-b", "chat:z": "cg-0"},
+        "order": {"cg-0": ["code:local_s1", "chat:z"], "cg-b": ["code:local_s4"]},
+        "pinnedName": "Pins"}
+    local = {"groups": [P0, mine, P1],
+             "assignments": {"cowork:local_q": "cg-0", "code:local_s1": "cg-0", "code:local_s2": "cg-1",
+                             "code:local_s4": "cg-b"},
+             "order": {"cg-b": ["code:local_s4"], "cg-0": ["code:local_s1"]}}
+    assert scopes["value"] == {"acctB/orgB": local}
+    assert prefs_of(live)["epitaxyPrefs"]["dframe-group-scopes"] == {"acctB/orgB": local}
+    assert run_groups(m, tmp_path, switch, live) == 0
+
+
+@pytest.mark.parametrize("kw", [{"owner": "someone-else"}, {"quarantine": "1"}])
+def test_group_sync_skips_when_the_app_would_not_migrate(m, tmp_path, kw):
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS, **dict(kw))
+    size = log_size(live)
+    assert run_groups(m, tmp_path, switch, live) == 0
+    assert log_size(live) == size
+
+
+def test_group_sync_without_owner_marker_still_carries(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, None, owner=None)
+    assert run_groups(m, tmp_path, switch, live) == 1
+    state, _ = read_groups(m, live)
+    assert state["customGroupsByScope"]["acctB/orgB"]["assignments"] == CARRIED
+
+
+def test_group_sync_skips_when_outgoing_has_no_groups(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, EMPTY_GROUPS, {"groups": [P0], "assignments": {}, "order": {}})
+    size = log_size(live)
+    assert run_groups(m, tmp_path, switch, live) == 0
+    assert log_size(live) == size
+
+
+def test_group_sync_dry_run_changes_nothing(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS, prefs_scopes={})
+    size, cfg = log_size(live), (live / "claude_desktop_config.json").read_text()
+    assert run_groups(m, tmp_path, switch, live, dry_run=True) == 1
+    assert log_size(live) == size
+    assert (live / "claude_desktop_config.json").read_text() == cfg
+    assert not (tmp_path / "groups.json").exists()
+
+
+def test_group_deleted_in_one_account_is_not_carried_back(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS)
+    assert run_groups(m, tmp_path, switch, live) == 1
+    kept = {"groups": [P0, P1], "assignments": CARRIED, "order": {"cg-0": ["code:local_s1"]}}
+    write_group_store(m, live, "acctB", "orgB", kept, owner="acctB")
+    assert run_groups(m, tmp_path, switch, live) == 0
+    state, _ = read_groups(m, live)
+    assert state["customGroupsByScope"]["acctB/orgB"]["groups"] == [P0, P1]
+    assert json.loads((tmp_path / "groups.json").read_text())["dropped"] == ["cg-2"]
+    third = write_group_store(m, tmp_path / "third", "acctC", "orgC", None, owner="acctC")
+    assert run_groups(m, tmp_path, (switch[0], "acctA", "acctC"), third) == 1
+    state, _ = read_groups(m, third)
+    assert state["customGroupsByScope"]["acctC/orgC"]["groups"] == [P0, P1]
+
+
+def test_unconsumed_migration_is_not_taken_as_a_deletion(m, tmp_path):
+    switch, live = group_switch(m, tmp_path, SOURCE_GROUPS, EMPTY_GROUPS)
+    assert run_groups(m, tmp_path, switch, live) == 1
+    state, _ = read_groups(m, live)
+    write_group_store(m, live, "acctB", "orgB", EMPTY_GROUPS, owner="acctB",
+                      pending=state["pendingLegacyGroupMigration"])
+    assert run_groups(m, tmp_path, switch, live) == 1
+    state, _ = read_groups(m, live)
+    assert [g["id"] for g in state["customGroupsByScope"]["acctB/orgB"]["groups"]] == ["cg-0", "cg-1", "cg-2"]
+    assert json.loads((tmp_path / "groups.json").read_text())["dropped"] == []
+
+
+def test_merge_migration_keeps_other_pending_groups(m):
+    old = {"groups": [grp("cg-old", "Old"), grp("cg-0", "stale")],
+           "assignments": {"chat:a": "cg-old", "code:local_s9": "cg-0"},
+           "order": {"cg-old": ["chat:a"]}, "pinnedName": "X"}
+    new = {"groups": [P0], "assignments": {"code:local_s1": "cg-0"}, "order": {}}
+    assert m.merge_migration(old, new, {"cg-old"}) == {
+        "pinnedName": "X", "groups": [P0],
+        "assignments": {"code:local_s9": "cg-0", "code:local_s1": "cg-0"}, "order": {}}
+    assert m.merge_migration(None, new, set()) == new
+
+
+def group_switch_in_main(m, tmp_path, monkeypatch):
+    two_account_store(m, tmp_path, monkeypatch, False)
+    cdir = make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", [])
+    write_group_store(m, tmp_path / "swivel" / "profiles" / "Prev" / "Claude", "acctA", "orgA",
+                      SOURCE_GROUPS, owner="acctA")
+    write_group_store(m, cdir, "acctB", "orgB", EMPTY_GROUPS, owner="acctB")
+    return cdir
+
+
+def test_group_sync_runs_on_switch_and_reports(m, tmp_path, monkeypatch, capsys):
+    cdir = group_switch_in_main(m, tmp_path, monkeypatch)
+    capsys.readouterr()
+    run_main(m, monkeypatch)
+    assert "groups-synced 1" in capsys.readouterr().out
+    state, _ = read_groups(m, cdir)
+    assert [g["name"] for g in state["customGroupsByScope"]["acctB/orgB"]["groups"]] == ["P0", "P1", "P2"]
+
+
+def test_group_sync_skipped_with_flag(m, tmp_path, monkeypatch, capsys):
+    cdir = group_switch_in_main(m, tmp_path, monkeypatch)
+    capsys.readouterr()
+    run_main(m, monkeypatch, argv=("--quiet", "--no-group-sync"))
+    assert "groups-synced 1" not in capsys.readouterr().out
+    state, _ = read_groups(m, cdir)
+    assert state["customGroupsByScope"]["acctB/orgB"] == EMPTY_GROUPS
