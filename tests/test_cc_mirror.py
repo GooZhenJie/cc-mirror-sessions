@@ -266,7 +266,8 @@ def test_quiet_summary_keeps_swivel_format(m, tmp_path, monkeypatch, capsys):
     run_main(m, monkeypatch)
     line = capsys.readouterr().out.strip()
     assert line.startswith("cc-mirror-sessions: added 0,")
-    assert line.endswith("state-synced 1, pin-list 0, pin-seeded 0, tasks-synced 0, tasks-sync-failed 0")
+    assert line.endswith("state-synced 1, pin-list 0, pin-seeded 0, tasks-synced 0, tasks-sync-failed 0, "
+                         "groups-synced 0")
 
 
 def make_claude_dir(tmp_path, acct, starred, order=None, running=False):
@@ -615,3 +616,130 @@ def test_task_sync_skipped_with_flag(m, tmp_path, monkeypatch):
     make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", ["local_s1"])
     run_main(m, monkeypatch, argv=("--quiet", "--no-task-sync"))
     assert not calls.exists()
+
+
+def section(sid, kind, order, name="", group_by=None, members=None):
+    s = {"id": sid, "kind": kind, "v": 2, "name": name, "order": order, "sortBy": "recency",
+         "ascending": False, "collapsed": False, "shown": True}
+    if group_by:
+        s["groupBy"] = group_by
+    if members is not None:
+        s["members"] = members
+    return s
+
+
+def sidebar(group_by, manual=(), members=True):
+    secs = [section("pinned", "pinned", 0)]
+    for i, (gid, name, mem) in enumerate(manual):
+        secs.append(section(gid, "manual", i + 1, name, members=list(mem) if members else []))
+    secs.append(section("routines", "routines", len(secs)))
+    secs.append(section("sessions", "sessions", len(secs), group_by=group_by))
+    return {"sections": secs, "migratedFrom": 1, "prefsSeeded": True}
+
+
+P_GROUPS = (("cg-0", "P0", ["code:local_s1"]), ("cg-1", "P1", []))
+
+
+def groups_of(manual):
+    assignments = {mid: gid for gid, _, mem in manual for mid in mem}
+    return {"groups": [{"id": gid, "name": name, "mode": "code"} for gid, name, _ in manual],
+            "assignments": assignments, "order": {gid: [] for gid, _, mem in manual if mem}}
+
+
+def put_groups(m, cdir, scope, manual, group_by, other=None):
+    scopes_store = {scope: sidebar(group_by, manual)}
+    scopes_ls = {scope: sidebar(group_by, manual, members=False)}
+    groups = {scope: groups_of(manual)}
+    if other:
+        scopes_store.update(other)
+        scopes_ls.update(other)
+    p = cdir / "claude_desktop_config.json"
+    cfg = json.loads(p.read_text())
+    cfg.setdefault("preferences", {}).setdefault("epitaxyPrefs", {})["dframe-code-sections"] = scopes_ls
+    p.write_text(json.dumps(cfg, indent=2))
+    ldir = make_ls(cdir / "Local Storage" / "leveldb")
+    m.ls_append_batch(str(ldir / "000003.log"), 1, [
+        (m.LS_STORE, m.ls_encode({"state": {"sidebarWidth": 300, "codeSidebarByScope": scopes_store,
+                                            "customGroupsByScope": groups,
+                                            "lastSidebarScopeKey": scope}, "version": 1})),
+        (m.LS_SECTIONS, m.ls_encode({"value": scopes_ls, "tabId": "", "timestamp": 1})),
+    ])
+
+
+def live_groups(m, cdir, scope):
+    best, _ = m.ls_read(str(cdir / "Local Storage" / "leveldb"), (m.LS_STORE, m.LS_SECTIONS))
+    store, sect = m.ls_decode(best.get(m.LS_STORE)), m.ls_decode(best.get(m.LS_SECTIONS))
+    cfg = prefs_of(cdir)["epitaxyPrefs"]["dframe-code-sections"]
+    state = store["state"]
+    return (state["customGroupsByScope"].get(scope),
+            [state["codeSidebarByScope"].get(scope), sect["value"].get(scope), cfg.get(scope)])
+
+
+def group_switch(m, tmp_path, monkeypatch, source_manual, target_manual=(), age=0):
+    two_account_store(m, tmp_path, monkeypatch, False)
+    cdir = make_switch(m, tmp_path, monkeypatch, "acctA", [], "acctB", [], age=age)
+    snap = tmp_path / "swivel" / "profiles" / "Prev" / "Claude"
+    put_groups(m, snap, "acctA/orgA", source_manual, "folder")
+    put_groups(m, cdir, "acctB/orgB", target_manual, "date",
+               other={"acctA/orgA": sidebar("state")})
+    return cdir
+
+
+def test_group_sync_carries_custom_groups_to_incoming(m, tmp_path, monkeypatch, capsys):
+    cdir = group_switch(m, tmp_path, monkeypatch, P_GROUPS, (("cg-old", "Old", []),))
+    capsys.readouterr()
+    run_main(m, monkeypatch)
+    assert capsys.readouterr().out.strip().endswith("groups-synced 1")
+    groups, views = live_groups(m, cdir, "acctB/orgB")
+    assert groups == groups_of(P_GROUPS)
+    assert views == [sidebar("date", P_GROUPS), sidebar("date", P_GROUPS, members=False),
+                     sidebar("date", P_GROUPS, members=False)]
+    assert live_groups(m, cdir, "acctA/orgA")[1] == [sidebar("state")] * 3
+    assert prefs_of(cdir)["epitaxyPrefs"]["other"] == {"keep": "me"}
+
+    capsys.readouterr()
+    run_main(m, monkeypatch)
+    assert "groups-synced" not in capsys.readouterr().out
+
+
+def test_group_sync_keeps_incoming_when_outgoing_has_none(m, tmp_path, monkeypatch):
+    mine = (("cg-mine", "Mine", ["code:local_s1"]),)
+    cdir = group_switch(m, tmp_path, monkeypatch, (), mine)
+    run_main(m, monkeypatch)
+    groups, views = live_groups(m, cdir, "acctB/orgB")
+    assert groups == groups_of(mine)
+    assert views[0] == sidebar("date", mine)
+
+
+def test_group_sync_follows_outgoing_section_order(m, tmp_path, monkeypatch):
+    cdir = group_switch(m, tmp_path, monkeypatch, P_GROUPS)
+    snap = tmp_path / "swivel" / "profiles" / "Prev" / "Claude"
+    moved = sidebar("folder", P_GROUPS)
+    moved["sections"][0]["order"], moved["sections"][2]["order"] = 2, 0
+    m.ls_append_batch(str(snap / "Local Storage" / "leveldb" / "000003.log"), 5, [
+        (m.LS_STORE, m.ls_encode({"state": {"codeSidebarByScope": {"acctA/orgA": moved},
+                                            "customGroupsByScope": {"acctA/orgA": groups_of(P_GROUPS)},
+                                            "lastSidebarScopeKey": "acctA/orgA"}, "version": 1}))])
+    run_main(m, monkeypatch)
+    ids = [s["id"] for s in live_groups(m, cdir, "acctB/orgB")[1][0]["sections"]]
+    assert ids == ["cg-1", "cg-0", "pinned", "routines", "sessions"]
+
+
+def test_group_sync_skipped_without_fresh_switch(m, tmp_path, monkeypatch):
+    cdir = group_switch(m, tmp_path, monkeypatch, P_GROUPS, age=m.SWIVEL_RUN_WINDOW + 60)
+    run_main(m, monkeypatch)
+    assert live_groups(m, cdir, "acctB/orgB")[0] == groups_of(())
+
+
+def test_group_sync_skipped_with_flag(m, tmp_path, monkeypatch):
+    cdir = group_switch(m, tmp_path, monkeypatch, P_GROUPS)
+    run_main(m, monkeypatch, argv=("--quiet", "--no-group-sync"))
+    assert live_groups(m, cdir, "acctB/orgB")[0] == groups_of(())
+
+
+def test_group_sync_dry_run_writes_nothing(m, tmp_path, monkeypatch):
+    cdir = group_switch(m, tmp_path, monkeypatch, P_GROUPS)
+    run_main(m, monkeypatch, argv=("--quiet", "--dry-run"))
+    groups, views = live_groups(m, cdir, "acctB/orgB")
+    assert groups == groups_of(())
+    assert views[2] == sidebar("date", (), members=False)

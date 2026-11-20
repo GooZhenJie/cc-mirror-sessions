@@ -68,6 +68,7 @@ Usage:
 """
 
 import argparse
+import copy
 import fcntl
 import glob
 import hashlib
@@ -856,6 +857,198 @@ def sync_scheduled_tasks(switch, dry_run):
         return 0, 1
 
 
+SECTIONS_PREF = "dframe-code-sections"
+LS_SECTIONS = LS_ORIGIN + b"LSS-persisted.dframe-code-sections"
+
+
+def dict_at(obj, key):
+    value = obj.get(key) if isinstance(obj, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def read_group_stores(cdir):
+    ldir = os.path.join(cdir, "Local Storage", "leveldb")
+    try:
+        best, max_seq = ls_read(ldir, (LS_STORE, LS_SECTIONS))
+        store, sect = ls_decode(best.get(LS_STORE)), ls_decode(best.get(LS_SECTIONS))
+    except Exception:
+        best, max_seq, store, sect = {}, 0, None, None
+    cfg_path = os.path.join(cdir, "claude_desktop_config.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            raw = f.read()
+        cfg = json.loads(raw)
+        prefs = cfg["preferences"]["epitaxyPrefs"]
+        if not isinstance(prefs, dict):
+            raise ValueError("epitaxyPrefs")
+    except Exception:
+        raw = cfg = prefs = None
+    state = store.get("state") if isinstance(store, dict) else None
+    return {"ldir": ldir, "best": best, "max_seq": max_seq, "store": store,
+            "state": state if isinstance(state, dict) else None, "sect": sect,
+            "cfg_path": cfg_path, "raw": raw, "cfg": cfg, "prefs": prefs}
+
+
+def store_views(stores):
+    return (dict_at(stores["state"], "codeSidebarByScope"),
+            dict_at(stores["sect"], "value"),
+            dict_at(stores["prefs"], SECTIONS_PREF))
+
+
+def outgoing_groups(stores, acct):
+    state = stores["state"]
+    if not state:
+        return None
+    by_scope = dict_at(state, "customGroupsByScope")
+    keys = sorted(k for k, v in by_scope.items() if k.split("/")[0] == acct and isinstance(v, dict)
+                  and isinstance(v.get("groups"), list) and v["groups"])
+    if not keys:
+        return None
+    last = state.get("lastSidebarScopeKey")
+    key = last if last in keys else keys[0]
+    return key, by_scope[key]
+
+
+def incoming_group_scope(stores, acct):
+    last = stores["state"].get("lastSidebarScopeKey") if stores["state"] else None
+    if isinstance(last, str) and last.split("/")[0] == acct and "/" in last:
+        return last
+    for scopes in store_views(stores) + (dict_at(stores["state"], "customGroupsByScope"),):
+        keys = sorted(k for k in scopes if k.split("/")[0] == acct and "/" in k)
+        if keys:
+            return keys[0]
+    try:
+        orgs = [o for o in os.listdir(os.path.join(BASE, acct))
+                if os.path.isdir(os.path.join(BASE, acct, o))]
+    except OSError:
+        return None
+    return "%s/%s" % (acct, orgs[0]) if len(orgs) == 1 else None
+
+
+def section_list(entry):
+    secs = entry.get("sections") if isinstance(entry, dict) else None
+    return [s for s in secs if isinstance(s, dict)] if isinstance(secs, list) else []
+
+
+def in_order(secs):
+    return [s for _, s in sorted(enumerate(secs), key=lambda p: (
+        p[1]["order"] if isinstance(p[1].get("order"), (int, float)) else p[0], p[0]))]
+
+
+def sections_with_groups(target, source, ids):
+    built_in = {s.get("id"): s for s in section_list(target) if s.get("kind") != "manual"}
+    out, seen = [], set()
+    for s in in_order(section_list(source)):
+        sid = s.get("id")
+        if s.get("kind") == "manual":
+            if sid in ids:
+                out.append(copy.deepcopy(s))
+        elif sid in built_in:
+            out.append(copy.deepcopy(built_in[sid]))
+        elif not built_in:
+            out.append(copy.deepcopy(s))
+        seen.add(sid)
+    out += [copy.deepcopy(s) for s in in_order(list(built_in.values())) if s.get("id") not in seen]
+    for i, s in enumerate(out):
+        s["order"] = i
+    base = target if isinstance(target, dict) else source if isinstance(source, dict) else {}
+    entry = {k: copy.deepcopy(v) for k, v in base.items() if k != "sections"}
+    entry["sections"] = out
+    return entry
+
+
+def ls_write(ldir, max_seq, puts):
+    logs = sorted(glob.glob(os.path.join(ldir, "*.log")), key=file_number)
+    if not logs:
+        return False
+    fd = os.open(os.path.join(ldir, "LOCK"), os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        ls_append_batch(logs[-1], max_seq + 1, puts)
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return True
+
+
+def write_config(cfg_path, cfg, raw):
+    body = json.dumps(cfg, indent=2, ensure_ascii=False)
+    if raw.endswith("\n"):
+        body += "\n"
+    try:
+        tmp = cfg_path + ".tmp-ccmirror"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+        shutil.copymode(cfg_path, tmp)
+        os.replace(tmp, cfg_path)
+    except OSError:
+        return False
+    return True
+
+
+def sync_custom_groups(switch, dry_run, claude_dir=None, now_ms=None):
+    """On a Swivel switch, give the incoming account the outgoing account's
+    custom sidebar groups (names, order and which sessions are in each) in
+    all three stores that hold them. An outgoing account with no groups
+    changes nothing. Returns 1 when anything changed."""
+    if not switch or not switch[2]:
+        return 0
+    snap, out_acct, in_acct = switch
+    src_stores = read_group_stores(snap)
+    found = outgoing_groups(src_stores, out_acct)
+    if found is None:
+        return 0
+    src_scope, groups = found
+    ids = {g.get("id") for g in groups["groups"] if isinstance(g, dict)}
+    live = read_group_stores(claude_dir or CLAUDE_DIR)
+    if claude_running(live["ldir"]):
+        return 0
+    scope = incoming_group_scope(live, in_acct)
+    if not scope:
+        return 0
+    src_views = store_views(src_stores)
+    store_src = src_views[0].get(src_scope)
+    entries = []
+    for i, views in enumerate(store_views(live)):
+        source = src_views[i].get(src_scope)
+        if not section_list(source):
+            source = store_src
+        entries.append(sections_with_groups(views.get(scope), source, ids))
+    stamp = now_ms or int(time.time() * 1000)
+    puts = []
+    state = live["state"]
+    if state is not None and glob.glob(os.path.join(live["ldir"], "*.log")):
+        by_groups = dict_at(state, "customGroupsByScope")
+        by_view = dict_at(state, "codeSidebarByScope")
+        if by_groups.get(scope) != groups or by_view.get(scope) != entries[0]:
+            state["customGroupsByScope"] = dict(by_groups, **{scope: copy.deepcopy(groups)})
+            state["codeSidebarByScope"] = dict(by_view, **{scope: entries[0]})
+            puts.append((LS_STORE, ls_encode(live["store"])))
+        sect = live["sect"]
+        if live["best"].get(LS_SECTIONS) is None or isinstance(sect, dict):
+            obj = dict(sect) if isinstance(sect, dict) else {"value": {}, "tabId": ""}
+            value = dict_at(obj, "value")
+            if value.get(scope) != entries[1]:
+                obj["value"], obj["timestamp"] = dict(value, **{scope: entries[1]}), stamp
+                puts.append((LS_SECTIONS, ls_encode(obj)))
+    changed = 0
+    if puts and (dry_run or ls_write(live["ldir"], live["max_seq"], puts)):
+        changed = 1
+    prefs = live["prefs"]
+    cur = prefs.get(SECTIONS_PREF, {}) if isinstance(prefs, dict) else None
+    if isinstance(cur, dict) and cur.get(scope) != entries[2]:
+        if dry_run:
+            changed = 1
+        else:
+            prefs[SECTIONS_PREF] = dict(cur, **{scope: entries[2]})
+            if write_config(live["cfg_path"], live["cfg"], live["raw"]):
+                changed = 1
+    return changed
+
+
 def seed_starred_from_list(folder_files, folders, acct, starred, dry_run):
     seeded = 0
     for a, _, path in folders:
@@ -900,6 +1093,8 @@ def main():
                     help="skip syncing isArchived/isStarred/title across accounts")
     ap.add_argument("--no-task-sync", action="store_true",
                     help="skip carrying scheduled tasks from the outgoing account on a Swivel switch")
+    ap.add_argument("--no-group-sync", action="store_true",
+                    help="skip carrying custom sidebar groups from the outgoing account on a Swivel switch")
     ap.add_argument("--archive", default=None, metavar="GLOB",
                     help="recursive glob for archived transcripts (default: \"archive\" "
                          "in ~/.claude/cc-mirror.json; no archive -> no revive step)")
@@ -1194,6 +1389,10 @@ def main():
     if not args.no_flag_sync:
         pin_list = sync_starred_list(folders, args.dry_run)
 
+    groups_synced = 0
+    if not args.no_group_sync:
+        groups_synced = sync_custom_groups(swivel_switch(), args.dry_run)
+
     # 2) Optional cleanup: remove DEAD (transcript-pruned) sessions spread to non-home
     #    accounts. Off by default — the Claude app prunes these itself on load.
     if args.prune:
@@ -1215,10 +1414,10 @@ def main():
     summary = (f"added {added}, repaired {fixed}, revived {revived}, pruned {pruned}, "
                f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}, "
                f"state-synced {state_synced}, pin-list {pin_list}, pin-seeded {seeded}, "
-               f"tasks-synced {tasks_synced}, tasks-sync-failed {tasks_failed}")
+               f"tasks-synced {tasks_synced}, tasks-sync-failed {tasks_failed}, groups-synced {groups_synced}")
     if args.quiet:
         if (added or fixed or pruned or revived or flag_synced or retitled or t_retitled or state_synced
-                or pin_list or seeded or tasks_synced or tasks_failed):
+                or pin_list or seeded or tasks_synced or tasks_failed or groups_synced):
             print(f"cc-mirror-sessions: {summary}")
     else:
         print(f"\n{(verb + ' ') if verb else ''}{'add/repair/prune' if verb else 'Done'}: {summary}\n")
