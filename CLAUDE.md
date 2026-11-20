@@ -296,11 +296,25 @@ Rules:
 Tested: unit tests (Python 3.9); copies of all three profiles, Personal → RAS → RASA → Personal → RAS (P0–P3
 with 5 assignments, 16 nav entries, width 363, 8 collapsed groups and editor vscode carried; RAS's permission
 mode and RASA's 3-day filter removed; the last two switches wrote nothing); `tools/simulate-switch --to RAS
---round-trip` (pins PASS, `sidebar-synced 1` into RAS, 0 back). Not yet seen: a real switch. Verify with
-`tools/pin-watch --detach` running before the switch: after launch the incoming account keeps
-`ls.store.groups`, `ls.store.display` and `cfg.prefs`, and `ls.pending` shows `<account>/<org>` and is then
-deleted once the upload succeeded. Rollback: `~/.claude/backups/sidebar-sync-20261120-122649/` (all three
-profiles' localStorage and config, the groups state, and the previous `~/bin/cc-mirror-sessions`).
+--round-trip` (pins PASS, `sidebar-synced 1` into RAS, 0 back).
+
+Real switches on 2026-11-20, from `~/Library/Logs/cc-mirror-pin-watch.log` (times are when pin-watch saw it):
+
+- Personal → RAS at 12:55:52, `sidebar-synced 1`: RAS went from no groups, nav `null`, 22 collapsed, editor
+  cursor and permission mode auto to P0–P3 with 5 assignments, 16 nav entries, 8 collapsed, vscode and no
+  permission mode. `ls.pending` held `<account>/<org>` at 12:55:56 and was gone at 12:56:02; nothing reverted.
+- RAS → RASA at 12:56:10, `sidebar-synced 1`: RASA ended with the same values; its width 420 became 363 and
+  its 3-day activity filter was removed. Marker gone at 12:56:19.
+- RASA → RAS at 12:56:26: nothing to write, so no marker. RAS still had P0–P3, 5 assignments, 16 nav entries
+  and width 363 at 12:56:35 and 12:57:30, so the server row holds them (before the marker existed, the server
+  copy replaced local groups 2.7 s and 6.5 s after launch).
+
+A deleted marker alone does not prove the upload, since `Ox` also clears it on 403/404; RASA has not been
+reopened without the marker yet. To check again, run `tools/pin-watch --detach` before the switch: after
+launch the incoming account keeps `ls.store.groups`, `ls.store.display` and `cfg.prefs`, `ls.pending` shows
+`<account>/<org>` and is then deleted, and the values survive the next launch without a marker. Rollback:
+`~/.claude/backups/sidebar-sync-20261120-122649/` (all three profiles' localStorage and config, the groups
+state, and the previous `~/bin/cc-mirror-sessions`).
 
 ### After editing the script
 
