@@ -156,6 +156,9 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
    IndexedDB) and checks config, localStorage and IndexedDB. It must fail on the old version for
    the reason seen in reality before a fix is trusted. It cannot simulate what the app does after
    launch; only a real switch with `pin-watch` running proves that.
+   For ad-hoc experiments on copies of the profiles, make a new directory for each run
+   (`mktemp -d "<scratchpad>/sim.XXXX"`) instead of clearing the previous one: `rm -rf` is blocked by
+   the rm-recursive-force guardrail and the scratchpad needs no cleanup (blocked twice on 2026-11-20).
 
 ### Other Claude Desktop state
 
@@ -227,8 +230,11 @@ server-synced sidebar store (same evidence as below).
 Consequences:
 
 - Each account keeps its own view by itself, independent of Swivel; set it once in each account.
-- Copying it on a switch cannot work; a write to all three stores was tried (e2b7484, reverted) and
-  the app put the account's value back on launch. Do not retry it.
+- Copying it on a switch without the pending-upload marker does not stick: a write to all three stores
+  was tried (e2b7484, reverted) and the app put the account's value back on launch. With the marker it
+  can be carried (next bullet). This bullet used to end "Do not retry it"; on 2026-11-20 an agent read
+  that as "impossible" and the owner had to push back twice before the marker was found. When recording
+  a failed attempt, say what was tried, not that it cannot work.
 - `tools/pin-watch` logs the three copies (`cfg.view`, `ls.sections.view`, `ls.store.view`) if this
   needs re-checking after an app update.
 - The pending-upload marker described in "Sidebar carry on a switch" makes the local copy win at launch, so
@@ -355,7 +361,9 @@ state, and the previous `~/bin/cc-mirror-sessions`).
 
 1. Tests on the Python that actually runs it:
    `~/.local/bin/uvx --python /usr/bin/python3 pytest -q tests` and
-   `/usr/bin/python3 -m py_compile cc-mirror-sessions`
+   `PYTHONPYCACHEPREFIX="$TMPDIR/pycache" /usr/bin/python3 -m py_compile cc-mirror-sessions`
+   (the prefix keeps `__pycache__` out of the clone, checked with /usr/bin/python3 on 2026-11-20; a
+   leftover one is gitignored, leave it: `rm -rf` is blocked by the rm-recursive-force guardrail)
 2. `/usr/bin/python3 cc-mirror-sessions --dry-run` against the real store — read-only, safe while
    Claude Desktop is open. Check the counts are plausible and the run takes well under 30s.
 3. For anything touching pins: `tools/simulate-switch --round-trip --script ./cc-mirror-sessions`.
