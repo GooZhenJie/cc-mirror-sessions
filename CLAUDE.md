@@ -162,7 +162,7 @@ launches**. "Written" proves nothing here; every wrong turn above had a successf
 - Other localStorage keys: `epitaxy-folder-permission-mode.<accountUuid>` (per-account folder
   permission mode), `starred-session-groups`, `dframe-group-scopes` (local-only part of custom groups),
   `dframe-store.state.customGroupsByScope` (custom groups and their session assignments; the group list is
-  held per account on the server, see "Custom sidebar groups" below). The sidebar view is not synced (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
+  carried on a switch, see "Sidebar carry on a switch" below). The built-in sections' view settings are not carried (see "Sidebar view" below). Other `pin-state` IndexedDB keys (`dframe-session-groups`,
   `dframe-pinned-project-outputs`, `dframe-starred-cowork-remote`, …) are not synced either.
 - `local-agent-mode-sessions/<account>/<org>/` is Cowork, not Claude Code; out of scope.
 
@@ -220,7 +220,7 @@ swapped folder, so it is held by Anthropic per account.
 
 What this covers: only the built-in sections' view fields (`groupBy`, `sortBy`, `ascending`, `show`,
 `collapsed`, `shown`). e2b7484 deliberately left custom (`kind: "manual"`) sections alone, so this test
-says nothing about them; they were tested separately on 2026-11-20 and are server-side too, see "Custom sidebar groups" below.
+says nothing about them; they were tested separately on 2026-11-20 and are server-side too, see "Sidebar carry on a switch" below.
 The app's code confirms the view part: `groupByByMode`, `sortByByMode` and `sidebarSections` are wire keys of the
 server-synced sidebar store (same evidence as below).
 
@@ -231,67 +231,76 @@ Consequences:
   the app put the account's value back on launch. Do not retry it.
 - `tools/pin-watch` logs the three copies (`cfg.view`, `ls.sections.view`, `ls.store.view`) if this
   needs re-checking after an app update.
+- The pending-upload marker described in "Sidebar carry on a switch" makes the local copy win at launch, so
+  the view could now be carried the same way. It is not: it was not part of the owner's 2026-11-20
+  decisions (on that day all three accounts grouped Sessions by folder).
 
-### Custom sidebar groups: carried through the app's own legacy migration (added 2026-11-20)
+### Sidebar carry on a switch: groups, nav entries, display settings (2026-11-20)
 
-Custom groups (the owner's P0–P3) have local copies per scope `<account>/<org>`:
+`sync_sidebar()` runs on a Swivel switch (same `swivel_switch()` checks as pin seeding) and gives the
+incoming account the outgoing account's:
 
-| Store | What it holds |
-|---|---|
-| localStorage `dframe-store` → `state.customGroupsByScope[scope]` | `groups` (`id` `cg-…`, `name`, `mode`), `assignments` (`code:local_<id>` → group id), `order` |
-| localStorage `dframe-store` → `state.codeSidebarByScope[scope].sections` | one `kind: "manual"` section per group, with `members` |
-| localStorage `LSS-persisted.dframe-code-sections` and config `epitaxyPrefs["dframe-code-sections"]` | same sections, `members` written as `[]` |
-| localStorage `LSS-persisted.dframe-group-scopes` and config `epitaxyPrefs["dframe-group-scopes"]` | local-only part: groups that hold this device's sessions and those assignments, merged in at launch (existing keys win, missing ones are added) |
+| Item | Where | On Anthropic's server too? |
+|---|---|---|
+| Custom groups (P0–P3) and their `code:local_*` assignments | `dframe-store` → `state.customGroupsByScope[<account>/<org>]`; local slice `dframe-group-scopes` (localStorage and config) | yes, wire keys `customGroups*` |
+| Nav entries at the top left | `dframe-store` → `state.navPinnedIds`, `navPinV` | yes, in `eAt` |
+| Sidebar width, collapsed folder groups | `dframe-store` → `state.sidebarWidth`, `state.collapsedGroups` | no |
+| Editor for "open in editor" | pref `claude-code-preferred-editor` | no |
+| Session activity filter | pref `code-sessions-state-activity-days.<account>` | no |
+| New-session permission mode | pref `cc-landing-draft-permission-mode.<account>` | no |
 
-**Writing the group list directly does not work.** Real switch Personal → RASA on 2026-11-20 with `pin-watch`
-running: 8070a55 wrote P0–P3 into dframe-store, `LSS-persisted.dframe-code-sections` and the config at
-11:07:36; the app rewrote the config without them at +2.7 s and both localStorage keys at +6.5 s
-(`groups: []`). Reverted in e39f784. Why, from the code (Claude 6.28899.2, `ion-dist.asar` →
-`/assets/v1/index-DxfrQydf.js`, sync module `shared-5-bRuN4H_n.js`, groups `shared-107-DTjE99PW.js`):
+Prefs live in config `epitaxyPrefs[<name>]` and localStorage `LSS-persisted.<name>` (`{value, tabId, timestamp}`).
+The app reads the config first and falls back to localStorage (`W_` and `tv` in `shared-1-BtdOJW1_.js`), so
+both are written and a missing value is removed from both. Account-keyed names map from the outgoing
+account's key to the incoming account's key.
 
-- The sidebar store `ob` (persisted as `dframe-store`) is server-synced:
-  `KM(ob, eAt, {extraWireKeys: ["customGroups","customGroupAssignments","customGroupOrder", …, "sidebarSections"],
-  serverPartialize: iAt, serverMerge: uX, mergePendingSeed: oAt, stripAccountSlice, onIdentityResolve, …})`.
-- `uX` (server row → local): the group list becomes the server's; local `code:local_*` assignments are kept
-  for group ids in that list. `iAt` (local → server) sends groups and only non-local assignments.
+**Server-synced items need the app's pending-upload marker.** Writing them alone does not stick: 8070a55
+wrote P0–P3 into all local copies on 2026-11-20 and the app put the server's empty list back within 7 s
+(reverted in e39f784). Code (Claude 6.28899.2, `ion-dist.asar`, sync module `shared-5-bRuN4H_n.js`,
+sidebar store `index-DxfrQydf.js`, groups `shared-107-DTjE99PW.js`): the sidebar store `ob` (`dframe-store`)
+is registered with `KM(ob, eAt, {extraWireKeys, serverPartialize: iAt, serverMerge: uX, mergePendingSeed: oAt, …})`,
+and launch reconcile (`CC`) applies the account's server row over local state, unless
+`ccd-sync-pending:ccd/dframe-store` matches the vouched identity `<account>/<org>` (`Dx`). With that marker and
+no `|migrate` suffix it keeps local state, takes the server row as the base and uploads the full local row (`Hx`).
+It is the marker `jx(…, "edit")` writes after a local edit. So when groups or nav change, `sync_sidebar()`:
 
-**What works: `state.pendingLegacyGroupMigration`.** It is the app's path for moving groups from the
-pre-scope format into an account. The persisted state keeps it (`partialize`, and `merge` normalises it).
-When the account and org are known, `onIdentityResolve` merges it into the active scope with
-`Iv(migration, existing)` (the existing entry wins per group id and per assignment key), calls
-`EQe(ob)`, which sets `ccd-sync-pending:ccd/dframe-store` to `<account>/<org>|migrate`, and clears the field.
-It does this only if `ccd-sync-owner` is missing or equals the account and `ccd-sync-quarantine` is not `1`
-(otherwise it keeps the field for later, or drops it on a foreign owner). Reconcile (`CC`) then sees the
-`|migrate` marker and runs `oAt`: server row merged in, groups = union of server and local with local
-winning, uploaded to the account's server copy. The app builds the manual sections from the groups itself
-(`yp` in shared-107), so `codeSidebarByScope` is not written.
+1. writes the marker `<account>/<ccd-sync-org>`, only when `ccd-sync-org` is known, `ccd-sync-owner` is missing
+   or the incoming account, and `ccd-sync-quarantine` is not `1` (otherwise only the local-only items are carried);
+2. deletes `ccd-sync-pending-base:ccd/dframe-store` if present (with a stored base reconcile folds the server row in);
+3. sets `pendingLegacyGroupMigration` to null: `onIdentityResolve` would otherwise call `EQe`, turn the marker
+   into `|migrate`, and the server row would win for everything except groups. 5f3cf26 carried groups only
+   through that legacy migration; this replaced it.
 
-What `sync_custom_groups()` does on a Swivel switch (same `swivel_switch()` checks as pin seeding):
+Manual sections are not written: the store's persist `merge` runs `Tg` for every scope on load, which adds a
+`kind: "manual"` section for each group without one (before `sessions`, default settings) and drops sections
+of removed groups.
 
-1. Outgoing scope: the outgoing account's entry with groups, preferring `lastSidebarScopeKey`. Incoming
-   scope: `<account>/<ccd-sync-org>`, else `lastSidebarScopeKey`, else the only entry. Skips when the
-   outgoing account has no groups, `ccd-sync-owner` names another account, or quarantine is set.
-2. Incoming entry: the outgoing version of each shared group (renames follow), outgoing groups it lacks
-   appended, its own groups kept. `code:local_*` assignments to the outgoing account's groups follow the
-   outgoing account, including moves and removals; other assignments and its own groups stay.
-3. `pendingLegacyGroupMigration` = the outgoing groups and their `code:local_*` assignments, merged with any
-   unconsumed one; this is what makes the app upload the result.
-4. `dframe-group-scopes` (localStorage and config) gets the same local assignments, so the launch merge
-   does not add back an assignment the outgoing account removed.
-5. Nothing is written when the incoming entry already matches.
+Cost, accepted by the owner on 2026-11-20 (decision page 1-B): the incoming account's whole sidebar row on the
+server (pins order, view settings, filters, groups, nav) is replaced by this Mac's copy, so changes made to
+that account on another device since it was last open here are lost.
 
-Deletions do not spread: the upload is a union, so a group deleted in one account stays in the others'
-server copies. To keep it from coming back, `~/.claude/cc-mirror-groups.json` records the group ids last
-seen per account; an id that vanishes from an account whose migration was consumed goes into `dropped`
-and is never carried again. Delete such a group in each account. Summary item `groups-synced N`; opt out
-with `--no-group-sync`.
+Rules:
 
-Tested: unit tests, a run on copies of all three profiles (Personal → RAS → RASA carried P0–P3 and 5
-assignments, a second run wrote nothing, only `customGroupsByScope`, `pendingLegacyGroupMigration` and
-`dframe-group-scopes` changed), and `tools/simulate-switch --round-trip` (pins PASS, `groups-synced 1` on
-the way back into RASA). Not yet seen: the app consuming the migration after a real switch. Check with
-`pin-watch` running: P0–P3 must still be in `ls.store.groups` for the incoming scope after launch, and
-`ccd-sync-pending:ccd/dframe-store` should appear and then go once the upload is done.
+- Groups: shared ids take the outgoing version (renames follow), outgoing groups are appended, incoming-only
+  groups stay; `code:local_*` assignments follow the outgoing account, including moves and removals.
+  `~/.claude/cc-mirror-groups.json` records the ids seen per account; an id that disappears from an account
+  (with no unconsumed legacy migration) goes into `dropped` and is removed from every account it is carried into.
+- Nav: copied only when the outgoing `navPinnedIds` is a list. `null` means the account never customised its
+  nav (no UI path sets it back to null; only `stripAccountSlice` does, on an account change), so it never
+  overwrites a customised list. `navSeedHere` is set to null, as `uX` does when it takes a server list.
+- Display settings and prefs: the outgoing value wins, including "not set" (coming from an account without an
+  activity filter removes the incoming account's filter). Owner's choice, 2026-11-20 (decision page 2-A).
+- Nothing is written when the incoming account already matches. Summary item `sidebar-synced N`; opt out with
+  `--no-sidebar-sync`.
+
+Tested: unit tests (Python 3.9); copies of all three profiles, Personal → RAS → RASA → Personal → RAS (P0–P3
+with 5 assignments, 16 nav entries, width 363, 8 collapsed groups and editor vscode carried; RAS's permission
+mode and RASA's 3-day filter removed; the last two switches wrote nothing); `tools/simulate-switch --to RAS
+--round-trip` (pins PASS, `sidebar-synced 1` into RAS, 0 back). Not yet seen: a real switch. Verify with
+`tools/pin-watch --detach` running before the switch: after launch the incoming account keeps
+`ls.store.groups`, `ls.store.display` and `cfg.prefs`, and `ls.pending` shows `<account>/<org>` and is then
+deleted once the upload succeeded. Rollback: `~/.claude/backups/sidebar-sync-20261120-122649/` (all three
+profiles' localStorage and config, the groups state, and the previous `~/bin/cc-mirror-sessions`).
 
 ### After editing the script
 

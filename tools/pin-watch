@@ -18,7 +18,10 @@ LS_KEYS = {
     b"_https://claude.ai\x00\x01LSS-persisted.dframe-local-slice": "ls.slice",
     b"_https://claude.ai\x00\x01LSS-persisted.dframe-code-sections": "ls.sections",
     b"_https://claude.ai\x00\x01dframe-store": "ls.store",
+    b"_https://claude.ai\x00\x01ccd-sync-pending:ccd/dframe-store": "ls.pending",
 }
+PREFS = ("claude-code-preferred-editor", "code-sessions-state-activity-days.{acct}",
+         "cc-landing-draft-permission-mode.{acct}")
 
 
 def varint(buf, pos):
@@ -196,6 +199,9 @@ def read_local_storage(ldir=LS_DIR):
             continue
         try:
             text = value[1:].decode("utf-16-le") if value[:1] == b"\x00" else value[1:].decode("latin-1")
+            if name == "ls.pending":
+                out[name] = {"seq": seq, "value": text}
+                continue
             obj = json.loads(text)
         except Exception:
             out[name] = {"seq": seq, "unparsed": True}
@@ -205,9 +211,16 @@ def read_local_storage(ldir=LS_DIR):
             val = val.get("pinnedOrder")
         if name == "ls.store":
             out["ls.groups"] = {"seq": seq, "value": (obj.get("state") or {}).get("customGroupsByScope")}
+            out["ls.display"] = {"seq": seq, "value": display_of(obj.get("state") or {})}
             val = (obj.get("state") or {}).get("codeSidebarByScope")
         out[name] = {"seq": seq, "ts": obj.get("timestamp"), "value": val}
     return out
+
+
+def display_of(state):
+    nav = state.get("navPinnedIds")
+    return {"nav": len(nav) if isinstance(nav, list) else nav, "navPinV": state.get("navPinV"),
+            "width": state.get("sidebarWidth"), "collapsed": len(state.get("collapsedGroups") or [])}
 
 
 def view_of(scopes, acct):
@@ -303,6 +316,9 @@ def snapshot():
                               value=view_of((ls["ls.store"] or {}).get("value"), acct)),
         "ls.store.groups": dict(seq=(ls.get("ls.groups") or {}).get("seq"),
                                 value=groups_of((ls.get("ls.groups") or {}).get("value"), acct)),
+        "ls.store.display": ls.get("ls.display"),
+        "ls.pending": ls["ls.pending"],
+        "cfg.prefs": {name.split(".")[0]: prefs.get(name.format(acct=acct)) for name in PREFS},
     }
 
 
